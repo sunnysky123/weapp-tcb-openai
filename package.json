@@ -1,0 +1,21 @@
+{
+  "name": "cloudbase-openai-adapter",
+  "version": "0.1.0",
+  "description": "将腾讯云 CloudBase Node SDK 的大模型调用封装为 OpenAI Chat Completions 兼容接口，供本地 agent 使用",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "test:nonstream": "node scripts/test-nonstream.js",
+    "test:stream": "node scripts/test-stream.js",
+    "test:tools": "node scripts/test-tools.js",
+    "test:mock": "node scripts/test-mock.js && node scripts/test-mock.js --prompt"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@cloudbase/node-sdk": "^3.18.3"
+  },
+  "license": "MIT"
+}
