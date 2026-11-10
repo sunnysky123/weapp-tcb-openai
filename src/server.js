@@ -18,13 +18,20 @@ function readBody(req, limit = 20 * 1024 * 1024) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     let size = 0;
+    let tooLarge = false;
     req.on('data', (c) => {
       size += c.length;
       if (size > limit) {
-        reject(
-          openaiError('request body too large', 'invalid_request_error', 'body_too_large', 413)
-        );
-        req.destroy();
+        if (!tooLarge) {
+          tooLarge = true;
+          chunks.length = 0;
+          // 立即抛给调用方回 413；不 req.destroy()，否则客户端只会看到
+          // ECONNRESET 而拿不到 413
+          reject(
+            openaiError('request body too large', 'invalid_request_error', 'body_too_large', 413)
+          );
+        }
+        // 继续吸收（丢弃）剩余请求体，让连接正常收尾、响应能送达
         return;
       }
       chunks.push(c);
@@ -65,13 +72,37 @@ function checkAuth(req) {
 // ---------------------------------------------------------------- 错误响应
 
 function sendError(res, e) {
+  if (res.writableEnded || res.destroyed) return; // 响应已结束/连接已断：不再写
   const payload = e && e.openai ? e.openai : { error: { message: 'internal error', type: 'api_error', code: null } };
   const status = (e && e.status) || 500;
-  if (!res.headersSent) {
+  if (res.headersSent) {
+    // 响应头已发出（SSE 已开始）：状态码改不了，以 error 帧收尾，避免裸 JSON 混进事件流
+    if (res._sse) {
+      res.write(`data: ${JSON.stringify(payload)}\n\n`);
+      res.write('data: [DONE]\n\n');
+      res.end();
+    } else {
+      res.end(JSON.stringify(payload));
+    }
+  } else {
     res.writeHead(status, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(payload));
   }
-  res.end(JSON.stringify(payload));
   if (config.debug && e && !e.openai) console.error(e);
+}
+
+// ---------------------------------------------------------------- 客户端断开取消
+
+// 客户端提前断开时取消上游生成（避免上游白跑继续计费）。
+// 必须挂在 res 的 close 上：req 的 close 在请求体读完后就已经触发过，
+// 之后客户端断开不会再触发（实测探针：res close ✅ / req close ❌）。
+// 正常完成时 writableFinished 为 true，不会误伤。
+function abortOnClientClose(res) {
+  const controller = new AbortController();
+  res.on('close', () => {
+    if (!res.writableFinished) controller.abort();
+  });
+  return controller.signal;
 }
 
 // ---------------------------------------------------------------- 路由
@@ -124,19 +155,15 @@ const routes = {
     const wantsStream = body.stream === true;
 
     if (wantsStream) {
-      res.writeHead(200, {
-        'Content-Type': 'text/event-stream; charset=utf-8',
-        'Cache-Control': 'no-cache',
-        Connection: 'keep-alive',
-        'X-Accel-Buffering': 'no',
-      });
-      const controller = new AbortController();
-      req.on('close', () => controller.abort());
-      await cb.chatCompletionStream(cloudbaseParams, openaiTools, requestedModel, res, controller.signal);
+      // SSE 响应头由 cb.chatCompletionStream 在拿到上游数据、写首个 chunk 前才发，
+      // 上游早期报错（如 429）才能以正确状态码返回而不是 200 + SSE 里的裸 JSON
+      const signal = abortOnClientClose(res);
+      await cb.chatCompletionStream(cloudbaseParams, openaiTools, requestedModel, res, signal);
       return;
     }
 
-    const { raw } = await cb.chatCompletion(cloudbaseParams, openaiTools, requestedModel);
+    const signal = abortOnClientClose(res);
+    const raw = await cb.chatCompletion(cloudbaseParams, openaiTools, requestedModel, signal);
     const completion = buildCompletionResponse(raw);
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(completion));
@@ -147,8 +174,21 @@ const routes = {
 
 const server = http.createServer(async (req, res) => {
   const key = `${req.method} ${req.url.split('?')[0]}`;
+  // CORS：让浏览器端 / webview 客户端也能直连（错误路径同样生效，writeHead 会合并这里的字段）
+  res.setHeader('Access-Control-Allow-Origin', '*');
   try {
-    checkAuth(req);
+    // 预检请求不鉴权，直接放行
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204, {
+        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+        'Access-Control-Allow-Headers': 'Authorization, Content-Type',
+        'Access-Control-Max-Age': '86400',
+      });
+      res.end();
+      return;
+    }
+    // /health 豁免鉴权：探活 / 负载均衡不应拿到 401
+    if (key !== 'GET /health') checkAuth(req);
     const handler = routes[key];
     if (!handler) {
       throw openaiError(

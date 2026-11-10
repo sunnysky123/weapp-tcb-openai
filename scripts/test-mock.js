@@ -10,11 +10,15 @@ if (process.argv.includes('--prompt')) process.env.TOOLS_MODE = 'prompt';
 
 process.env.TCB_ENV_ID = process.env.TCB_ENV_ID || 'mock-env';
 process.env.PORT = process.env.PORT || '8092';
+// 开启鉴权以覆盖鉴权路径（/health 豁免、未带 key 401 等）
+const TEST_API_KEY = (process.env.API_KEY = process.env.API_KEY || 'mock-test-key');
 
 // ---- 在加载任何业务代码前，hook require，替换 @cloudbase/node-sdk ----
 const Module = require('module');
 const origLoad = Module._load;
 let nativeToolsRequests = 0; // 记录原生工具模式被使用的次数
+let lastGenerateParams = null; // 记录最近一次 generateText 参数（system 合并断言用）
+let lastStreamSignal = null; // 记录最近一次 streamText 收到的 abort signal（断开取消断言用）
 
 const fakeModel = {
   // 模拟用户实际遇到的场景：模型把内部 DSML 函数调用标记当文本输出
@@ -24,6 +28,15 @@ const fakeModel = {
 </｜｜DSML｜｜ invoke>
 </｜｜DSML｜｜ functions>`,
 
+  // fenced JSON 工具块按小分片吐出（开标签/字段名被拆散到多个 chunk）
+  FENCED_JSON_PARTS: [
+    '```',
+    'json\n{"tool',
+    '_calls":[{"name":"get_weather"',
+    ',"arguments":{"city":"北京"}}]}',
+    '\n```',
+  ],
+
   // 识别适配器降级模式注入的工具协议 system 提示词
   isPromptMode(params) {
     return (params.messages || []).some(
@@ -32,6 +45,7 @@ const fakeModel = {
   },
 
   async generateText(params) {
+    lastGenerateParams = params;
     if (this.isPromptMode(params)) {
       // 降级模式：按协议输出工具调用块（天气→JSON fence；分析→泄漏的 DSML 标记）
       const hasToolResult = params.messages.some((m) => m.role === 'tool');
@@ -114,7 +128,8 @@ const fakeModel = {
           usage: { inputTokens: 30, outputTokens: 15 },
         };
       }
-      // 第一轮：返回结构化 tool_calls
+      // 第一轮：返回结构化 tool_calls，但 finish_reason 是 'stop'
+      // （模拟实测：上游同时给 tool_calls + stop，适配器必须覆盖为 'tool_calls'）
       return {
         text: '',
         rawResponses: [
@@ -132,7 +147,7 @@ const fakeModel = {
                     },
                   ],
                 },
-                finish_reason: 'tool_calls',
+                finish_reason: 'stop',
               },
             ],
             usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
@@ -164,8 +179,44 @@ const fakeModel = {
 
   async streamText(params) {
     const self = this;
+    lastStreamSignal = params.signal || null;
     const userMsg = [...params.messages].reverse().find((m) => m.role === 'user');
     const wantsView = userMsg && String(userMsg.content).includes('分析');
+
+    // 上游早期失败（如 429）：适配器应返回正确的 HTTP 状态码而非 200 + SSE
+    if (userMsg && String(userMsg.content).includes('上游错误')) {
+      throw new Error('mock upstream 429');
+    }
+
+    // 慢速输出（断开取消测试用）：客户端 abort 后停止生成
+    if (userMsg && String(userMsg.content).includes('慢慢说')) {
+      async function* slowStream() {
+        for (const w of ['第一', '第二', '第三']) {
+          if (params.signal && params.signal.aborted) throw new Error('mock aborted');
+          yield { choices: [{ delta: { content: w } }] };
+          await new Promise((r) => setTimeout(r, 120));
+        }
+        yield { choices: [{ delta: {}, finish_reason: 'stop' }] };
+      }
+      return {
+        dataStream: slowStream(),
+        usage: Promise.resolve({ inputTokens: 1, outputTokens: 1 }),
+        messages: Promise.resolve(params.messages),
+      };
+    }
+
+    // 流中途出错：已吐出一个 content chunk 后上游断掉
+    if (userMsg && String(userMsg.content).includes('中途错误')) {
+      async function* brokenStream() {
+        yield { choices: [{ delta: { content: '答案' } }] };
+        throw new Error('mock mid-stream boom');
+      }
+      return {
+        dataStream: brokenStream(),
+        usage: Promise.resolve({ inputTokens: 5, outputTokens: 1 }),
+        messages: Promise.resolve(params.messages),
+      };
+    }
 
     // 降级模式的流式：适配器会缓冲全文再合成 chunk
     const promptText = this.isPromptMode(params)
@@ -191,6 +242,14 @@ const fakeModel = {
           yield { choices: [{ delta: {}, finish_reason: 'stop' }] };
           return;
         }
+        // 模拟 fenced JSON 工具块按小分片吐出（开标签被拆包的泄漏场景）
+        if (userMsg && String(userMsg.content).includes('分片')) {
+          for (const p of self.FENCED_JSON_PARTS) {
+            yield { choices: [{ delta: { content: p } }] };
+          }
+          yield { choices: [{ delta: {}, finish_reason: 'stop' }] };
+          return;
+        }
         yield {
           choices: [
             {
@@ -205,7 +264,8 @@ const fakeModel = {
         yield {
           choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: '{"city":"北京"}' } }] } }],
         };
-        yield { choices: [{ delta: {}, finish_reason: 'tool_calls' }] };
+        // 上游同时给 tool_calls + 'stop'：适配器必须覆盖为 'tool_calls'
+        yield { choices: [{ delta: {}, finish_reason: 'stop' }] };
         return;
       }
       // 模拟 reasoning + content 分块输出
@@ -239,10 +299,10 @@ Module._load = function (request, parent, isMain) {
 // ---- 启动真实 server 并测试 ----
 const BASE = `http://127.0.0.1:${process.env.PORT}`;
 
-async function post(body) {
+async function post(body, headers = {}) {
   const res = await fetch(`${BASE}/v1/chat/completions`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${TEST_API_KEY}`, ...headers },
     body: JSON.stringify(body),
   });
   return res;
@@ -250,11 +310,14 @@ async function post(body) {
 
 async function readSSE(res) {
   const text = await res.text();
-  const chunks = text
+  const frames = text
     .split('\n\n')
     .filter((f) => f.startsWith('data: ') && !f.includes('[DONE]'))
     .map((f) => JSON.parse(f.slice(6)));
-  return { chunks, gotDone: text.includes('data: [DONE]') };
+  // 标准 chunk 都带 choices；error 帧（流中途出错）没有，单独挑出来
+  const chunks = frames.filter((o) => o.choices);
+  const errorFrame = frames.find((o) => o.error) || null;
+  return { chunks, gotDone: text.includes('data: [DONE]'), errorFrame, raw: text };
 }
 
 async function main() {
@@ -265,9 +328,8 @@ async function main() {
 
   // 1. DSML 解析单元测试（用户实际遇到的泄漏样例）
   {
-    const { parseDsmlToolCalls, parseToolCallsFromText } = require('../src/convert.js');
-    const c = require('../src/convert.js');
-    const sample = `好的，我先读取文件。\n${c.genId('x') && ''}<｜｜DSML｜｜ functions>
+    const { parseToolCallsFromText } = require('../src/convert.js');
+    const sample = `好的，我先读取文件。\n<｜｜DSML｜｜ functions>
 <｜｜DSML｜｜ invoke name="view">
 <｜｜DSML｜｜ parameter name="path" string="true">c:\\Users\\sunny\\Downloads\\Source\\weapp-openai\\package.json</｜｜DSML｜｜ parameter>
 </｜｜DSML｜｜ invoke>
@@ -338,6 +400,7 @@ async function main() {
     assert.strictEqual(tc.function.name, 'get_weather');
     assert.deepStrictEqual(JSON.parse(tc.function.arguments), { city: '北京' });
     assert.ok(data.usage.prompt_tokens > 0);
+    assert.ok(!JSON.stringify(data).includes('_index'), '非流式响应不应泄漏内部字段 _index');
 
     // 第二轮（与上一轮构成同一用例）：回传 tool 结果
     const messages = [
@@ -463,6 +526,170 @@ async function main() {
     const last = chunks[chunks.length - 1];
     assert.strictEqual(last.choices[0].finish_reason, 'tool_calls');
     console.log('✅ 8. DSML 泄漏兜回（流式拆包分片，无标记泄漏 + tool_calls 合成）');
+    passed++;
+  }
+
+  const weatherTool = {
+    type: 'function',
+    function: {
+      name: 'get_weather',
+      description: '查天气',
+      parameters: { type: 'object', properties: { city: { type: 'string' } } },
+    },
+  };
+
+  // 9. fenced JSON 工具块分片流式：开标签/字段名被拆到多个 chunk 也不得泄漏（P0-3）
+  {
+    const res = await post({
+      model: 'hy3',
+      stream: true,
+      messages: [{ role: 'user', content: '北京天气？分片输出' }],
+      tools: [weatherTool],
+    });
+    const { chunks, gotDone } = await readSSE(res);
+    assert.ok(gotDone);
+    const contentAll = chunks.map((c) => c.choices[0].delta.content || '').join('');
+    assert.ok(!contentAll.includes('```'), 'fence 开标签不得泄漏给客户端');
+    assert.ok(!contentAll.includes('tool_calls'), '工具块 JSON 不得混进 content');
+    const toolChunks = chunks.flatMap((c) => c.choices[0].delta.tool_calls || []);
+    assert.ok(toolChunks.length >= 1, '应有 tool_calls delta');
+    assert.deepStrictEqual(
+      JSON.parse(toolChunks.map((t) => (t.function ? t.function.arguments : '')).join('')),
+      { city: '北京' }
+    );
+    assert.strictEqual(chunks[chunks.length - 1].choices[0].finish_reason, 'tool_calls');
+    console.log('✅ 9. fenced JSON 分片流式不泄漏（开标签扣留 → tool_calls 合成）');
+    passed++;
+  }
+
+  // 10. finish_reason 覆盖：tool_calls + 上游 'stop' → 必须修正为 'tool_calls'（P1-5）
+  {
+    const { resolveFinishReason } = require('../src/convert.js');
+    assert.strictEqual(resolveFinishReason('stop', true), 'tool_calls');
+    assert.strictEqual(resolveFinishReason(null, true), 'tool_calls');
+    assert.strictEqual(resolveFinishReason('length', true), 'length'); // 截断原因保留
+    assert.strictEqual(resolveFinishReason('stop', false), 'stop');
+    // 端到端覆盖：用例 4/5 的 mock 上游即返回 finish_reason: 'stop' + 结构化 tool_calls
+    console.log('✅ 10. finish_reason 覆盖（单元 + 用例4/5 端到端，length 等原因不被误改）');
+    passed++;
+  }
+
+  // 11. 流式上游早期报错 → 正确状态码的 JSON 错误（而非 200 + SSE 裸 JSON）（P0-2）
+  {
+    const res = await post({
+      model: 'hy3',
+      stream: true,
+      messages: [{ role: 'user', content: '上游错误' }],
+    });
+    assert.strictEqual(res.status, 502);
+    assert.ok(
+      (res.headers.get('content-type') || '').includes('application/json'),
+      '早期报错应是 JSON 错误响应，而非 text/event-stream'
+    );
+    const data = await res.json();
+    assert.strictEqual(data.error.code, 'upstream_error');
+    console.log('✅ 11. 流式上游早期报错返回 502 JSON（writeHead 时机修正）');
+    passed++;
+  }
+
+  // 12. 流中途出错：错误不得混入 content，以独立 error 帧收尾（P2/P0-2）
+  {
+    const res = await post({
+      model: 'hy3',
+      stream: true,
+      messages: [{ role: 'user', content: '中途错误' }],
+    });
+    assert.strictEqual(res.status, 200);
+    const { chunks, gotDone, errorFrame } = await readSSE(res);
+    assert.ok(gotDone);
+    const contentAll = chunks.map((c) => c.choices[0].delta.content || '').join('');
+    assert.strictEqual(contentAll, '答案');
+    assert.ok(!contentAll.includes('[stream error'), '错误文本不得混入 content');
+    assert.ok(errorFrame, '应以独立 error 帧告知客户端');
+    console.log('✅ 12. 流中途错误以 error 帧收尾（不污染正文）');
+    passed++;
+  }
+
+  // 13. 客户端断开 → 上游 abort 取消生成（P0-1）
+  {
+    const ac = new AbortController();
+    const res = await fetch(`${BASE}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${TEST_API_KEY}` },
+      body: JSON.stringify({
+        model: 'hy3',
+        stream: true,
+        messages: [{ role: 'user', content: '慢慢说' }],
+      }),
+      signal: ac.signal,
+    });
+    assert.strictEqual(res.status, 200);
+    const reader = res.body.getReader();
+    await reader.read(); // 收到首个 SSE chunk
+    ac.abort(); // 模拟客户端断开
+    await new Promise((r) => setTimeout(r, 500));
+    assert.ok(lastStreamSignal, 'abort signal 应已传入上游');
+    assert.strictEqual(lastStreamSignal.aborted, true, '客户端断开后应 abort 上游生成');
+    try {
+      await reader.cancel();
+    } catch {
+      // 连接已断，忽略
+    }
+    console.log('✅ 13. 客户端断开 → 上游 abort 生效（res close 侧挂载）');
+    passed++;
+  }
+
+  // 14. 超限请求体 → 413 JSON（而非 ECONNRESET）（P2）
+  {
+    const big = 'x'.repeat(21 * 1024 * 1024);
+    const res = await post({ model: 'hy3', messages: [{ role: 'user', content: big }] });
+    assert.strictEqual(res.status, 413);
+    const data = await res.json();
+    assert.strictEqual(data.error.code, 'body_too_large');
+    console.log('✅ 14. 超限请求体返回 413 JSON（先回包后 drain）');
+    passed++;
+  }
+
+  // 15. /health 豁免鉴权，其余路由未授权仍 401（P2）
+  {
+    const health = await fetch(`${BASE}/health`);
+    assert.strictEqual(health.status, 200, '/health 不应要求鉴权');
+    const models = await fetch(`${BASE}/v1/models`);
+    assert.strictEqual(models.status, 401, '未带 key 访问 /v1/models 应 401');
+    console.log('✅ 15. /health 豁免鉴权（探活可用），其余路由仍 401 保护');
+    passed++;
+  }
+
+  // 16. CORS 预检：OPTIONS 不鉴权、返回 CORS 头（P2）
+  {
+    const opt = await fetch(`${BASE}/v1/chat/completions`, { method: 'OPTIONS' });
+    assert.strictEqual(opt.status, 204);
+    assert.strictEqual(opt.headers.get('access-control-allow-origin'), '*');
+    assert.ok((opt.headers.get('access-control-allow-headers') || '').includes('Authorization'));
+    console.log('✅ 16. OPTIONS 预检放行并返回 CORS 头');
+    passed++;
+  }
+
+  // 17. 降级模式 system 合并：客户端自带 system 时不产生两条 system（P2）
+  {
+    await post({
+      model: 'hy3',
+      messages: [
+        { role: 'system', content: '你是测试助手' },
+        { role: 'user', content: '北京天气？' },
+      ],
+      tools: [weatherTool],
+    });
+    const msgs = (lastGenerateParams && lastGenerateParams.messages) || [];
+    const systems = msgs.filter((m) => m.role === 'system');
+    assert.strictEqual(systems.length, 1, '应只有一条 system 消息（合并而非追加）');
+    if (promptMode) {
+      assert.ok(systems[0].content.includes('# Tool Calling Protocol'), '工具协议应注入');
+      assert.ok(systems[0].content.includes('你是测试助手'), '客户端 system 应被合并保留');
+    } else {
+      assert.strictEqual(systems[0].content, '你是测试助手', '原生模式不应注入协议提示词');
+    }
+    console.log(`✅ 17. system 消息合并（${promptMode ? '协议 + 客户端内容合一' : '原生模式透传'}）`);
     passed++;
   }
 

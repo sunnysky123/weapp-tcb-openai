@@ -6,7 +6,13 @@ const {
   extractFromRawResponses,
   normalizeUsage,
   buildToolSystemPrompt,
+  buildChunk,
+  sseWrite,
+  genId,
   parseToolCallsFromText,
+  dsmlHoldLen,
+  fenceHoldLen,
+  resolveFinishReason,
   openaiError,
 } = require('./convert');
 
@@ -57,16 +63,18 @@ function getModel() {
 
 // ---------------------------------------------------------------- 工具模式状态
 
-// auto 模式下若原生路径失败，进程内记住并降级，避免每次都白试一次
-let nativeDisabled = false;
+// auto 模式下原生路径失败后的降级开关：带 TTL，到期自动恢复原生模式重试，
+// 避免一次偶发网络抖动导致整个进程永久降级到 prompt 模式（工具质量静默下降且无恢复路径）
+const NATIVE_RETRY_DELAY_MS = 60 * 1000;
+let nativeDisabledUntil = 0;
 
 // ---------------------------------------------------------------- 非流式 chat
 
 /**
- * 处理非流式请求，返回 OpenAI chat.completion 响应对象。
+ * 处理非流式请求，返回 buildCompletionResponse 所需的 raw 形状。
  * tools 为已转换的 CloudBase 工具数组（可能为空）。
  */
-async function chatCompletion(cloudbaseParams, openaiTools, requestedModel) {
+async function chatCompletion(cloudbaseParams, openaiTools, requestedModel, signal) {
   const hasTools = openaiTools && openaiTools.length > 0;
   const useNativeTools = hasTools && modeUsesNative();
 
@@ -76,27 +84,28 @@ async function chatCompletion(cloudbaseParams, openaiTools, requestedModel) {
       params.tools = openaiTools;
       params.maxSteps = 1; // 只让模型走一步：产出 tool_calls 即停，不在服务端执行
     }
+    if (signal) params.signal = signal; // 客户端断开时取消上游生成
     try {
       const result = await getModel().generateText(params);
       return buildTextResponse(result, requestedModel, useNativeTools);
     } catch (e) {
       if (useNativeTools && config.toolsMode === 'auto') {
-        nativeDisabled = true;
+        nativeDisabledUntil = Date.now() + NATIVE_RETRY_DELAY_MS;
         log(`native tool path failed (${e.message}); falling back to prompt mode`);
-        return promptModeCompletion(cloudbaseParams, openaiTools, requestedModel);
+        return promptModeCompletion(cloudbaseParams, openaiTools, requestedModel, signal);
       }
       throw toOpenAIError(e);
     }
   }
 
   // prompt 模式
-  return promptModeCompletion(cloudbaseParams, openaiTools, requestedModel);
+  return promptModeCompletion(cloudbaseParams, openaiTools, requestedModel, signal);
 }
 
 function modeUsesNative() {
   if (config.toolsMode === 'native') return true;
   if (config.toolsMode === 'prompt') return false;
-  return !nativeDisabled; // auto
+  return Date.now() >= nativeDisabledUntil; // auto：降级 TTL 过期后自动重试原生
 }
 
 // 把 generateText 的结果转成 OpenAI 响应
@@ -147,23 +156,39 @@ function buildTextResponse(result, requestedModel, cameFromNativeTools) {
   const usage = extracted.usage || normalizeUsage(result && result.usage);
 
   return {
-    id: undefined, // 由调用方 buildCompletionResponse 生成
-    raw: {
-      model: requestedModel,
-      message,
-      finishReason,
-      usage,
-    },
+    model: requestedModel,
+    message,
+    finishReason,
+    usage,
   };
 }
 
-// 降级：提示词注入模式
-async function promptModeCompletion(cloudbaseParams, openaiTools, requestedModel) {
-  const messages = [...(cloudbaseParams.messages || [])];
-  messages.unshift({ role: 'system', content: buildToolSystemPrompt(openaiTools) });
+// 注入工具协议 system 提示词：客户端自带 system 时合并进第一条，
+// 避免出现两条 system（部分模型只认第一条，注入的工具协议会被忽略）
+function injectToolProtocol(messages, toolPrompt) {
+  const msgs = [...(messages || [])];
+  const first = msgs[0];
+  if (first && first.role === 'system') {
+    if (typeof first.content === 'string') {
+      msgs[0] = { ...first, content: `${toolPrompt}\n\n${first.content}` };
+    } else if (Array.isArray(first.content)) {
+      msgs[0] = { ...first, content: [{ type: 'text', text: toolPrompt }, ...first.content] };
+    } else {
+      msgs[0] = { ...first, content: toolPrompt };
+    }
+  } else {
+    msgs.unshift({ role: 'system', content: toolPrompt });
+  }
+  return msgs;
+}
+
+// 降级：提示词注入模式。返回 buildCompletionResponse 所需的 raw 形状
+async function promptModeCompletion(cloudbaseParams, openaiTools, requestedModel, signal) {
+  const messages = injectToolProtocol(cloudbaseParams.messages, buildToolSystemPrompt(openaiTools));
 
   // 工具协议走提示词注入，SDK 层的工具参数不传
   const { tools: _t, toolChoice: _tc, ...restParams } = cloudbaseParams;
+  if (signal) restParams.signal = signal;
 
   const result = await getModel().generateText({
     ...restParams,
@@ -174,25 +199,21 @@ async function promptModeCompletion(cloudbaseParams, openaiTools, requestedModel
   const parsed = parseToolCallsFromText(text);
   if (parsed && parsed.toolCalls.length > 0) {
     return {
-      raw: {
-        model: requestedModel,
-        message: {
-          role: 'assistant',
-          content: parsed.content,
-          tool_calls: parsed.toolCalls,
-        },
-        finishReason: 'tool_calls',
-        usage: normalizeUsage(result && result.usage),
+      model: requestedModel,
+      message: {
+        role: 'assistant',
+        content: parsed.content,
+        tool_calls: parsed.toolCalls,
       },
+      finishReason: 'tool_calls',
+      usage: normalizeUsage(result && result.usage),
     };
   }
   return {
-    raw: {
-      model: requestedModel,
-      message: { role: 'assistant', content: text },
-      finishReason: 'stop',
-      usage: normalizeUsage(result && result.usage),
-    },
+    model: requestedModel,
+    message: { role: 'assistant', content: text },
+    finishReason: 'stop',
+    usage: normalizeUsage(result && result.usage),
   };
 }
 
@@ -221,8 +242,10 @@ async function chatCompletionStream(cloudbaseParams, openaiTools, requestedModel
     const streamRes = await getModel().streamText(params);
     await pumpNativeStream(streamRes, requestedModel, res, hasTools);
   } catch (e) {
-    if (useNativeTools && config.toolsMode === 'auto') {
-      nativeDisabled = true;
+    // 只有还没向客户端写过任何字节（headers 未发出）时才能安全降级，
+    // 否则 fallback 重跑整次请求会导致重复输出
+    if (useNativeTools && config.toolsMode === 'auto' && !res.headersSent) {
+      nativeDisabledUntil = Date.now() + NATIVE_RETRY_DELAY_MS;
       log(`native tool path failed (${e.message}); falling back to prompt mode`);
       return promptModeStream(cloudbaseParams, openaiTools, requestedModel, res);
     }
@@ -230,19 +253,50 @@ async function chatCompletionStream(cloudbaseParams, openaiTools, requestedModel
   }
 }
 
+// SSE 响应头必须等到确定开始流式输出时（拿到上游数据、写首个 chunk 前）再发：
+// 提前发 200 会把上游早期错误（如 429）变成 "HTTP 200 + SSE 里的裸 JSON"，
+// 骗过客户端的状态码重试逻辑
+function beginSse(res) {
+  if (!res.headersSent) {
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache',
+      Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no',
+    });
+  }
+  res._sse = true; // 供 sendError 判断：头已发出且是 SSE 流 → 以 error 帧收尾
+}
+
+// 流中途出错时以独立 error 帧告知客户端（不混入 content），随后正常收尾
+function sseWriteError(res, e) {
+  if (res.writableEnded || res.destroyed) return;
+  const payload =
+    (e && e.openai) || {
+      error: {
+        message: `stream error: ${(e && e.message) || 'unknown'}`,
+        type: 'api_error',
+        code: null,
+      },
+    };
+  res.write(`data: ${JSON.stringify(payload)}\n\n`);
+}
+
 async function pumpNativeStream(streamRes, requestedModel, res, hasTools) {
-  const { buildChunk, sseWrite, genId, parseToolCallsFromText, dsmlHoldLen } = require('./convert');
   const meta = { id: genId('chatcmpl'), model: requestedModel };
 
+  beginSse(res); // 首个 chunk 前才发响应头：上游早期报错仍能以正确状态码返回
   // 首个 chunk：role
   sseWrite(res, buildChunk({ ...meta, delta: { role: 'assistant', content: '' } }));
 
-  let pending = ''; // 未下发的文本（含 DSML 前缀观察窗口 / 缓冲区）
+  let pending = ''; // 未下发的文本（含 DSML/fence 前缀观察窗口 / 缓冲区）
   let bufferedMode = false; // 检测到泄漏的工具调用标记后，转为全量缓冲
+  let fenceHold = false; // 已见 ``` 开标签但还未判定是否 fenced 工具块 → 全部扣留观察
   let fullText = ''; // 全量原始文本（结束时解析用）
   let sawToolCalls = false; // SDK 已给出结构化 tool_calls
   let finishReason = null;
   let chunkUsage = undefined;
+  let streamError = null; // 流中途错误（收尾时以 error 帧告知，不混入正文）
 
   const emitContent = (t) => {
     if (t) sseWrite(res, buildChunk({ ...meta, delta: { content: t } }));
@@ -258,22 +312,58 @@ async function pumpNativeStream(streamRes, requestedModel, res, hasTools) {
       pending = '';
       return;
     }
-    // DSML 开标签（或 JSON 工具块）出现 → 之前的内容照发，之后转缓冲
+
     const dsmlIdx = pending.search(/<\/?[｜|]{0,2}\s*DSML/);
-    const jsonIdx =
-      pending.includes('```json') && pending.includes('"tool_calls"')
-        ? pending.indexOf('```')
-        : -1;
-    const hit = dsmlIdx !== -1 && (jsonIdx === -1 || dsmlIdx < jsonIdx) ? dsmlIdx : jsonIdx;
-    if (hit !== -1) {
-      const safe = pending.slice(0, hit);
+
+    // fence 观察态：``` 后还没等到判定 → 等 '"tool_calls"'（工具块证据）或闭合 fence（普通代码示例）
+    if (fenceHold) {
+      if (pending.includes('"tool_calls"') || dsmlIdx !== -1) {
+        // 确认是工具块（或 DSML 混入 fence 区）→ 转全量缓冲，结束时统一解析
+        bufferedMode = true;
+        fenceHold = false;
+        pending = '';
+        return;
+      }
+      if (pending.indexOf('```', 3) !== -1) {
+        // fence 已闭合且始终未见工具块 → 只是普通代码示例，整体放行
+        emitContent(pending);
+        pending = '';
+        fenceHold = false;
+        return;
+      }
+      return; // 未判定，继续全部扣留
+    }
+
+    // DSML 开标签出现 → 之前的内容照发，之后转缓冲
+    if (dsmlIdx !== -1) {
+      const safe = pending.slice(0, dsmlIdx);
       emitContent(safe);
       bufferedMode = true;
       pending = '';
       return;
     }
-    // 扣留可能是 "<｜｜DSML..." 前缀的尾巴，避免标记被拆包泄漏
-    const hold = dsmlHoldLen(pending);
+
+    // fenced 工具块：以 ``` 为观察起点。开标签与 '"tool_calls"' 可能被拆散到
+    // 多个 chunk（先到 "```"，此时 '"tool_calls"' 还不存在），不能等两者齐了才判定，
+    // 否则 fence 开标签会先泄漏给客户端；同时要放行普通代码示例 → 进入观察态等证据
+    const fenceIdx = pending.indexOf('```');
+    if (fenceIdx !== -1) {
+      if (pending.includes('"tool_calls"')) {
+        const safe = pending.slice(0, fenceIdx);
+        emitContent(safe);
+        bufferedMode = true;
+        pending = '';
+        return;
+      }
+      const safe = pending.slice(0, fenceIdx);
+      emitContent(safe);
+      pending = pending.slice(fenceIdx);
+      fenceHold = true;
+      return;
+    }
+
+    // 扣留可能是 "<｜｜DSML..." 或 "``" / "```j" 等开标签前缀的尾巴，避免标记被拆包泄漏
+    const hold = Math.max(dsmlHoldLen(pending), fenceHoldLen(pending));
     if (hold < pending.length) {
       const safe = pending.slice(0, pending.length - hold);
       emitContent(safe);
@@ -298,9 +388,10 @@ async function pumpNativeStream(streamRes, requestedModel, res, hasTools) {
       }
     }
   } catch (e) {
-    // 流中途出错：已写出的内容无法撤回，追加一段错误提示后正常收尾
+    // 流中途出错：不把错误文本混进正文（避免污染回答、被解析逻辑二次消费），
+    // 记录后在收尾阶段以独立 error 帧告知客户端
+    streamError = e;
     log(`stream error: ${e.message}`);
-    feedContent(`\n\n[stream error: ${e.message}]`);
   }
 
   // usage 优先取 CloudBase 汇总
@@ -313,7 +404,7 @@ async function pumpNativeStream(streamRes, requestedModel, res, hasTools) {
     // 拿不到就保持 chunkUsage
   }
 
-  let finalFinish = finishReason || (sawToolCalls ? 'tool_calls' : 'stop');
+  let finalFinish = resolveFinishReason(finishReason, sawToolCalls);
 
   if (bufferedMode && !sawToolCalls) {
     // 全量缓冲的文本里解析工具调用（DSML 或 fenced JSON）
@@ -344,16 +435,22 @@ async function pumpNativeStream(streamRes, requestedModel, res, hasTools) {
       log(`buffered markup parse failed, dropped ${pending.length} chars`);
     }
   } else if (!bufferedMode && pending) {
-    // 冲回扣留的观察窗口尾巴
+    // 冲回扣留的观察窗口尾巴（含未判定的 fence 观察区：不是工具块就当普通文本放行）
     emitContent(pending);
     pending = '';
+    fenceHold = false;
   }
+
+  // 流中途出错 → 独立 error 帧（客户端据此感知截断，而不是当成回答的一部分）
+  if (streamError) sseWriteError(res, streamError);
 
   // 收尾 chunk：finish_reason + usage
   const last = buildChunk({ ...meta, delta: {}, finishReason: finalFinish, usage });
   sseWrite(res, last);
-  res.write('data: [DONE]\n\n');
-  res.end();
+  if (!res.writableEnded && !res.destroyed) {
+    res.write('data: [DONE]\n\n');
+    res.end();
+  }
 }
 
 // dataStream 单个数据块 → OpenAI delta。兼容 OpenAI 形状与 AI SDK 形状
@@ -384,11 +481,12 @@ function mapStreamChunk(data) {
 
 // 降级流式：非流式请求 + 手动合成 chunk
 async function promptModeStream(cloudbaseParams, openaiTools, requestedModel, res) {
-  const { buildChunk, sseWrite, genId } = require('./convert');
   const meta = { id: genId('chatcmpl'), model: requestedModel };
 
-  const { raw } = await promptModeCompletion(cloudbaseParams, openaiTools, requestedModel);
+  const raw = await promptModeCompletion(cloudbaseParams, openaiTools, requestedModel);
   const message = raw.message;
+
+  beginSse(res); // 上游完成后再发响应头：降级请求失败也能以正确状态码返回
 
   sseWrite(res, buildChunk({ ...meta, delta: { role: 'assistant', content: '' } }));
 
@@ -420,8 +518,10 @@ async function promptModeStream(cloudbaseParams, openaiTools, requestedModel, re
     res,
     buildChunk({ ...meta, delta: {}, finishReason: raw.finishReason, usage: raw.usage })
   );
-  res.write('data: [DONE]\n\n');
-  res.end();
+  if (!res.writableEnded && !res.destroyed) {
+    res.write('data: [DONE]\n\n');
+    res.end();
+  }
 }
 
 // ---------------------------------------------------------------- 工具函数

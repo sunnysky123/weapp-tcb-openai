@@ -181,7 +181,8 @@ function sanitizeMessages(messages) {
         400
       );
     }
-    const cleaned = { role: m.role, content: m.content ?? '' };
+    // 带 tool_calls 的 assistant 消息保留 content: null（部分上游要求 null 而非空串）
+    const cleaned = { role: m.role, content: m.content ?? (Array.isArray(m.tool_calls) ? null : '') };
     // assistant 的 tool_calls 原样带回（多轮工具对话必需）
     if (Array.isArray(m.tool_calls)) cleaned.tool_calls = m.tool_calls;
     // tool 角色的 tool_call_id 保留
@@ -191,6 +192,16 @@ function sanitizeMessages(messages) {
 }
 
 // ---------------------------------------------------------------- 响应构建（非流式）
+
+// 结构化 tool_calls 存在时 finish_reason 必须是 'tool_calls'：
+// 上游可能同时给 tool_calls 和 finish_reason: 'stop'，若保留 'stop'，
+// 只看 finish_reason 的 agent 会静默跳过工具执行。length/content_filter 等原因仍保留。
+function resolveFinishReason(finishReason, hasToolCalls) {
+  if (hasToolCalls && (finishReason == null || finishReason === 'stop')) {
+    return 'tool_calls';
+  }
+  return finishReason || 'stop';
+}
 
 function buildCompletionResponse({ model, message, finishReason, usage }) {
   return {
@@ -202,7 +213,10 @@ function buildCompletionResponse({ model, message, finishReason, usage }) {
       {
         index: 0,
         message,
-        finish_reason: finishReason || (message.tool_calls ? 'tool_calls' : 'stop'),
+        finish_reason: resolveFinishReason(
+          finishReason,
+          Array.isArray(message.tool_calls) && message.tool_calls.length > 0
+        ),
       },
     ],
     usage: usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
@@ -230,6 +244,7 @@ function buildChunk({ id, model, delta, finishReason = null, usage = undefined }
 }
 
 function sseWrite(res, obj) {
+  if (res.writableEnded || res.destroyed) return; // 客户端已断开/已收尾时丢弃写入
   res.write(`data: ${JSON.stringify(obj)}\n\n`);
 }
 
@@ -318,6 +333,15 @@ function dsmlHoldLen(s) {
   return 0;
 }
 
+// 流式用：pending 尾部有多长的内容可能是 "```json" fence 开标签的前缀（需扣留观察）
+function fenceHoldLen(s) {
+  const opener = '```json';
+  for (let len = Math.min(s.length, opener.length); len > 0; len--) {
+    if (s.endsWith(opener.slice(0, len))) return len;
+  }
+  return 0;
+}
+
 // ---------------------------------------------------------------- 提示词注入模式（工具降级）
 
 function buildToolSystemPrompt(tools) {
@@ -353,10 +377,8 @@ function parseToolCallsFromText(text) {
   const fenceRe = /```(?:json)?\s*([\s\S]*?)```/g;
   let match;
   let lastParsed = null;
-  let firstFenceStart = -1;
 
   while ((match = fenceRe.exec(text)) !== null) {
-    if (firstFenceStart === -1) firstFenceStart = match.index;
     const candidate = match[1].trim();
     if (!candidate) continue;
     try {
@@ -371,7 +393,7 @@ function parseToolCallsFromText(text) {
       if (!calls) continue;
       const toolCalls = calls
         .filter((c) => c && typeof c.name === 'string')
-        .map((c, i) => ({
+        .map((c) => ({
           id: c.id || genId('call'),
           type: 'function',
           function: {
@@ -381,17 +403,18 @@ function parseToolCallsFromText(text) {
                 ? c.arguments
                 : JSON.stringify(c.arguments ?? c.parameters ?? {}),
           },
-          _index: i,
         }));
-      if (toolCalls.length > 0) lastParsed = { toolCalls };
+      // 记录命中工具块的 fence 起点：首个 fence 可能只是代码示例，
+      // content 不能按首个 fence 切（否则中间的说明文字会被吃掉）
+      if (toolCalls.length > 0) lastParsed = { toolCalls, start: match.index };
     } catch {
       // 不是合法 JSON 的代码块，忽略
     }
   }
 
   if (lastParsed) {
-    // fence 之前的文本视作普通 content
-    const content = text.slice(0, firstFenceStart).trim();
+    // 以命中工具块的 fence 为界，之前的文本视作普通 content
+    const content = text.slice(0, lastParsed.start).trim();
     return { toolCalls: lastParsed.toolCalls, content: content || null };
   }
 
@@ -424,12 +447,14 @@ module.exports = {
   toCloudbaseParams,
   sanitizeMessages,
   buildCompletionResponse,
+  resolveFinishReason,
   buildChunk,
   sseWrite,
   buildToolSystemPrompt,
   parseToolCallsFromText,
   parseDsmlToolCalls,
   dsmlHoldLen,
+  fenceHoldLen,
   mapToolChoice,
   openaiError,
 };
