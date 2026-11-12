@@ -22,8 +22,17 @@
 ```bash
 npm install
 cp .env.example .env   # 填入 TCB_ENV_ID / TCB_SECRET_ID / TCB_SECRET_KEY
-npm start              # 默认监听 http://127.0.0.1:8090
+npm start              # 默认监听 http://127.0.0.1:8090（监听地址由 .env 的 HOST 决定）
 ```
+
+如需让局域网内其它设备访问，把 `.env` 的 `HOST` 改成 `0.0.0.0`（或本机网卡 IP）：
+
+```bash
+HOST=0.0.0.0
+PORT=8090
+```
+
+此时请务必设置 `API_KEY`，否则同网段任何人都能调用本服务。启动日志会打印实际监听地址。
 
 验证：
 
@@ -65,6 +74,7 @@ console.log(res.choices[0].message.content);
 | `TCB_ENV_ID` | 是 | 云开发环境 ID |
 | `TCB_SECRET_ID` / `TCB_SECRET_KEY` | 本地运行需要 | 腾讯云 [API 密钥](https://console.cloud.tencent.com/cam/capi)；在云函数/云托管内可留空 |
 | `PORT` | 否 | 监听端口，默认 `8090` |
+| `HOST` | 否 | 监听地址（IP），默认 `127.0.0.1`（仅本机可访问）；填 `0.0.0.0` 监听所有网卡，或填本机某个网卡 IP（如 `192.168.1.10`） |
 | `API_KEY` | 否 | Bearer Token；设置后所有接口要求鉴权 |
 | `DEFAULT_MODEL` | 否 | 客户端未指定模型时使用，默认 `hy3` |
 | `MODEL_MAP` | 否 | JSON 别名表，如 `{"gpt-4o":"hy3"}` |

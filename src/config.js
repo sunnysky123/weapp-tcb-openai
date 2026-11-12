@@ -63,7 +63,8 @@ const config = {
 
   // 服务
   port: Number(process.env.PORT) || 8090,
-  host: process.env.HOST || '127.0.0.1',
+  // 监听地址：默认只绑回环。填 0.0.0.0 监听所有网卡，或填本机某个网卡 IP
+  host: (process.env.HOST || '').trim() || '127.0.0.1',
   apiKey: process.env.API_KEY || '',
   defaultModel: process.env.DEFAULT_MODEL || 'hy3',
   modelMap: parseModelMap(process.env.MODEL_MAP),
@@ -81,6 +82,7 @@ function logConfig() {
   console.log('[config] CloudBase → OpenAI adapter');
   console.log(`[config]   envId        : ${config.envId ? `${config.envId.slice(0, 4)}****` : '(未设置)'}`);
   console.log(`[config]   secretId     : ${config.secretId ? `${config.secretId.slice(0, 6)}****` : '(未设置，云函数内可留空)'}`);
+  console.log(`[config]   host         : ${config.host}`);
   console.log(`[config]   port         : ${config.port}`);
   console.log(`[config]   defaultModel : ${config.defaultModel}`);
   console.log(`[config]   modelMap     : ${JSON.stringify(config.modelMap)}`);

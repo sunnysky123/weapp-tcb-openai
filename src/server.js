@@ -172,6 +172,10 @@ const routes = {
 
 // ---------------------------------------------------------------- 服务器
 
+function isLoopback(host) {
+  return host === 'localhost' || host === '::1' || /^127\./.test(host);
+}
+
 const server = http.createServer(async (req, res) => {
   const key = `${req.method} ${req.url.split('?')[0]}`;
   // CORS：让浏览器端 / webview 客户端也能直连（错误路径同样生效，writeHead 会合并这里的字段）
@@ -206,7 +210,18 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(config.port, config.host, () => {
   logConfig();
-  console.log(`[server] listening on http://${config.host}:${config.port}`);
+  const shown = config.host.includes(':') ? `[${config.host}]` : config.host;
+  console.log(`[server] listening on http://${shown}:${config.port}`);
+  if (!isLoopback(config.host)) {
+    const wildcard = config.host === '0.0.0.0' || config.host === '::';
+    console.log(
+      `[server] 已监听非回环地址（${config.host}），局域网/外网可直接访问` +
+        (wildcard ? '（所有网卡）' : '')
+    );
+    if (!config.apiKey) {
+      console.warn('[server] 警告：当前未设置 API_KEY，任何能访问该端口的人都可以调用本服务');
+    }
+  }
   console.log('[server] OpenAI-compatible endpoints:');
   console.log('[server]   POST /v1/chat/completions');
   console.log('[server]   GET  /v1/models');
@@ -214,6 +229,13 @@ server.listen(config.port, config.host, () => {
 });
 
 server.on('error', (e) => {
-  console.error(`[server] failed to start: ${e.message}`);
+  if (e.code === 'EADDRNOTAVAIL') {
+    console.error(`[server] 无法绑定 ${config.host}:${config.port}：该 IP 不属于本机网卡`);
+    console.error('[server] 请把 .env 里的 HOST 改为本机实际 IP（如 192.168.x.x），或 0.0.0.0 监听所有网卡');
+  } else if (e.code === 'EACCES') {
+    console.error(`[server] 无法绑定端口 ${config.port}：权限不足或端口被占用`);
+  } else {
+    console.error(`[server] failed to start: ${e.message}`);
+  }
   process.exit(1);
 });
