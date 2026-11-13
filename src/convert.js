@@ -40,6 +40,34 @@ function fromOpenAITools(openaiTools) {
     .filter((t) => typeof t.name === 'string' && t.name);
 }
 
+// tool_calls[].function.arguments 必须是 JSON 字符串：
+// - 上游给对象 → 序列化
+// - 上游给空串/null/undefined → '{}'（空串会让客户端按“参数为空”处理）
+// - 已是字符串 → 原样保留（可能是分片累积中的半截 JSON）
+// 用显式类型判断而非 ||，避免合法值 '' / 0 被误判为缺失。
+function normalizeToolArguments(value) {
+  if (typeof value === 'string') return value === '' ? '{}' : value;
+  if (value === undefined || value === null) return '{}';
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return '{}';
+  }
+}
+
+// 规范化 tool_calls 数组：客户端可能把 arguments 回传成对象
+// （SDK 期望 JSON 字符串，否则上游直接 400）
+function normalizeToolCalls(toolCalls) {
+  if (!Array.isArray(toolCalls)) return toolCalls;
+  for (const tc of toolCalls) {
+    if (!tc || typeof tc !== 'object') continue;
+    if (!tc.type) tc.type = 'function';
+    const fn = tc.function && typeof tc.function === 'object' ? tc.function : (tc.function = {});
+    fn.arguments = normalizeToolArguments(fn.arguments);
+  }
+  return toolCalls;
+}
+
 // 从 SDK rawResponses 里防御式提取 tool_calls / reasoning_content / finish_reason
 function extractFromRawResponses(rawResponses) {
   const out = {
@@ -65,9 +93,11 @@ function extractFromRawResponses(rawResponses) {
         type: 'function',
         function: {
           name: (tc.function && tc.function.name) || tc.name || `tool_${i}`,
-          arguments:
-            (tc.function && tc.function.arguments) ||
-            (tc.arguments !== undefined ? JSON.stringify(tc.arguments) : '{}'),
+                  arguments: normalizeToolArguments(
+                    tc.function && tc.function.arguments !== undefined
+                      ? tc.function.arguments
+                      : tc.arguments
+                  ),
         },
       })),
     };
@@ -183,8 +213,8 @@ function sanitizeMessages(messages) {
     }
     // 带 tool_calls 的 assistant 消息保留 content: null（部分上游要求 null 而非空串）
     const cleaned = { role: m.role, content: m.content ?? (Array.isArray(m.tool_calls) ? null : '') };
-    // assistant 的 tool_calls 原样带回（多轮工具对话必需）
-    if (Array.isArray(m.tool_calls)) cleaned.tool_calls = m.tool_calls;
+        // assistant 的 tool_calls 原样带回（多轮工具对话必需），arguments 统一为 JSON 字符串
+            if (Array.isArray(m.tool_calls)) cleaned.tool_calls = normalizeToolCalls(m.tool_calls);
     // tool 角色的 tool_call_id 保留
     if (m.tool_call_id !== undefined) cleaned.tool_call_id = m.tool_call_id;
     return cleaned;
@@ -450,6 +480,8 @@ module.exports = {
   resolveFinishReason,
   buildChunk,
   sseWrite,
+    normalizeToolArguments,
+      normalizeToolCalls,
   buildToolSystemPrompt,
   parseToolCallsFromText,
   parseDsmlToolCalls,

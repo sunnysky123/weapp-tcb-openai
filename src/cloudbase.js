@@ -68,6 +68,25 @@ function getModel() {
 const NATIVE_RETRY_DELAY_MS = 60 * 1000;
 let nativeDisabledUntil = 0;
 
+// 只有“原生能力不可用”才值得全局降级。请求本身有问题（400/404/413 等 4xx）
+// 时降级毫无意义：prompt 模式同样会失败，还会让后续正常请求被拖去低质量的
+// prompt 路径（模型自由生成 JSON，容易漏参数）。这类错误必须只影响当前请求。
+const DEGRADABLE_STATUS = new Set([401, 403, 408, 429, 500, 502, 503, 504, undefined]);
+
+function isDegradableError(e) {
+  const status = Number(e && (e.status || e.statusCode || e.code));
+  if (Number.isFinite(status) && status >= 400 && status < 500) {
+    return DEGRADABLE_STATUS.has(status);
+  }
+  return true; // 网络错误 / 无状态码：可能是原生通道不可用，允许降级
+}
+
+// 请求级错误：原样透出 4xx，不要被包成 502/500
+function isClientError(e) {
+  const status = Number(e && (e.status || e.statusCode || e.code));
+  return Number.isFinite(status) && status >= 400 && status < 500;
+}
+
 // ---------------------------------------------------------------- 非流式 chat
 
 /**
@@ -89,7 +108,9 @@ async function chatCompletion(cloudbaseParams, openaiTools, requestedModel, sign
       const result = await getModel().generateText(params);
       return buildTextResponse(result, requestedModel, useNativeTools);
     } catch (e) {
-      if (useNativeTools && config.toolsMode === 'auto') {
+          // 请求级 4xx 不降级：降级只会把同样的错误再犯一次，还会把后续请求
+          // 拖进低质量的 prompt 路径（模型自由生成 JSON → 参数缺失/漏调）
+          if (useNativeTools && config.toolsMode === 'auto' && isDegradableError(e)) {
         nativeDisabledUntil = Date.now() + NATIVE_RETRY_DELAY_MS;
         log(`native tool path failed (${e.message}); falling back to prompt mode`);
         return promptModeCompletion(cloudbaseParams, openaiTools, requestedModel, signal);
@@ -190,10 +211,17 @@ async function promptModeCompletion(cloudbaseParams, openaiTools, requestedModel
   const { tools: _t, toolChoice: _tc, ...restParams } = cloudbaseParams;
   if (signal) restParams.signal = signal;
 
-  const result = await getModel().generateText({
-    ...restParams,
-    messages,
-  });
+  let result;
+  try {
+    result = await getModel().generateText({
+      ...restParams,
+      messages,
+    });
+  } catch (e) {
+    // 降级路径的异常同样需要包装：否则会以裸 Error 冒泡，
+    // 被 server 兜成 500 "internal error"，丢掉上游状态码与原因
+    throw toOpenAIError(e);
+  }
   const text = (result && result.text) || '';
 
   const parsed = parseToolCallsFromText(text);
@@ -245,7 +273,12 @@ async function chatCompletionStream(cloudbaseParams, openaiTools, requestedModel
   } catch (e) {
     // 只有还没向客户端写过任何字节（headers 未发出）时才能安全降级，
     // 否则 fallback 重跑整次请求会导致重复输出
-    if (useNativeTools && config.toolsMode === 'auto' && !sink.res.headersSent) {
+        if (
+          useNativeTools &&
+          config.toolsMode === 'auto' &&
+          !sink.res.headersSent &&
+          isDegradableError(e)
+        ) {
       nativeDisabledUntil = Date.now() + NATIVE_RETRY_DELAY_MS;
       log(`native tool path failed (${e.message}); falling back to prompt mode`);
       return promptModeStream(cloudbaseParams, openaiTools, requestedModel, sink, signal);
@@ -527,6 +560,20 @@ async function promptModeStream(cloudbaseParams, openaiTools, requestedModel, si
 function toOpenAIError(e) {
   if (e && e.openai) return e;
   const message = (e && e.message) || 'internal error';
+
+  // 上游 4xx 是请求本身的问题（消息格式/参数不合法）：保留状态码，
+  // 让客户端看到可诊断的错误，而不是被包成 502 "internal error"
+  if (isClientError(e)) {
+    const status = Number(e.status || e.statusCode || e.code);
+    const detail = e.requestId ? ` (requestId: ${e.requestId})` : '';
+    return openaiError(
+      `CloudBase rejected the request: ${message}${detail}`,
+      'invalid_request_error',
+      'upstream_bad_request',
+      status
+    );
+  }
+
   const err = openaiError(`CloudBase SDK error: ${message}`, 'api_error', 'upstream_error', 502);
   return err;
 }
@@ -542,4 +589,6 @@ module.exports = {
   chatCompletionStream,
   createChatSink,
   toOpenAIError,
+  isDegradableError,
+  isClientError,
 };

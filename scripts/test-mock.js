@@ -1066,6 +1066,46 @@ async function main() {
     passed++;
   }
 
+  // 31. arguments 归一化：空串/null/对象 都不能变成"参数为空"
+  {
+    const { normalizeToolArguments, sanitizeMessages } = require('../src/convert.js');
+    assert.strictEqual(normalizeToolArguments(''), '{}', '空串应补成 {}');
+    assert.strictEqual(normalizeToolArguments(null), '{}');
+    assert.strictEqual(normalizeToolArguments(undefined), '{}');
+    assert.strictEqual(normalizeToolArguments({ title: '甲' }), '{"title":"甲"}');
+    assert.strictEqual(normalizeToolArguments('{"a":1}'), '{"a":1}', '已是字符串应原样保留');
+
+    // 客户端把 arguments 作为对象回传时，必须转成字符串再交给上游
+    const msgs = sanitizeMessages([
+      { role: 'user', content: 'x' },
+      {
+        role: 'assistant',
+        content: null,
+        tool_calls: [{ id: 'c1', type: 'function', function: { name: 'f', arguments: { a: 1 } } }],
+      },
+      { role: 'tool', tool_call_id: 'c1', content: 'ok' },
+    ]);
+    assert.strictEqual(typeof msgs[1].tool_calls[0].function.arguments, 'string');
+    assert.strictEqual(msgs[1].tool_calls[0].function.arguments, '{"a":1}');
+    console.log('✅ 31. arguments 归一化（空串/对象 → JSON 字符串，不再"参数为空"）');
+    passed++;
+  }
+
+  // 32. 请求级 4xx 不得触发全局降级（否则后续请求被迫走 prompt 模式丢参数）
+  {
+    const { isDegradableError } = require('../src/cloudbase.js');
+    const mk = (code) => ({ message: 'x', code: String(code) });
+    assert.strictEqual(isDegradableError(mk(400)), false, '400 是请求错误，不应降级');
+    assert.strictEqual(isDegradableError(mk(404)), false);
+    assert.strictEqual(isDegradableError(mk(422)), false);
+    assert.strictEqual(isDegradableError(mk(429)), true, '限流可以重试降级');
+    assert.strictEqual(isDegradableError(mk(502)), true);
+    assert.strictEqual(isDegradableError(mk(503)), true);
+    assert.strictEqual(isDegradableError(new Error('socket hang up')), true, '网络错误允许降级');
+    console.log('✅ 32. 4xx 不再全局降级（429/5xx/网络错误仍降级）');
+    passed++;
+  }
+
   console.log(`\n🎉 端到端 mock 测试全部通过（共 ${passed} 组，TOOLS_MODE=${promptMode ? 'prompt' : 'auto/native'}）`);
   process.exit(0);
 }
