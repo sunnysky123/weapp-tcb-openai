@@ -524,8 +524,12 @@ function createResponsesSink(res, meta = {}) {
   function addCallEntry(entry) {
     if (entry.added) return;
     entry.added = true;
-    const item = addEntry(entry.item);
-    entry.outputIndex = item.outputIndex;
+      // 必须把 byIndex 里的这个 entry 本身登记进 state.items：
+      // 若改用 addEntry(item) 新建包装对象，arguments 会累积在原 entry.text 上，
+      // 而 finishEntry 遍历的是新对象（text 恒为 ''），最终 completed.output
+      // 里的 function_call.arguments 就是空串，客户端会报"参数缺失"。
+      entry.outputIndex = state.items.length;
+      state.items.push(entry);
     emit('response.output_item.added', { output_index: entry.outputIndex, item: entry.item });
   }
 

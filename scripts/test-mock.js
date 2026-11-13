@@ -853,7 +853,19 @@ async function main() {
     assert.ok(call, 'completed 响应里应含 function_call');
     assert.strictEqual(call.name, 'get_weather');
     assert.strictEqual(call.status, 'completed');
-    console.log('✅ 21. Responses 流式工具调用（arguments delta → function_call 条目）');
+        // completed.output 里的 arguments 必须与 delta 聚合结果一致：
+            // 客户端若从 completed 取参数，空串会导致"参数缺失"（rename_chat 报错即此）
+            assert.strictEqual(
+              call.arguments,
+              argDeltas,
+              'completed 里的 function_call.arguments 必须等于 delta 聚合值'
+            );
+            assert.ok(call.arguments.length > 0, 'function_call.arguments 不能为空串');
+            assert.deepStrictEqual(JSON.parse(call.arguments), { city: '北京' });
+            // 顺带校验 arguments.done 事件携带同样的完整参数
+            const argsDone = events.find((e) => e.type === 'response.function_call_arguments.done');
+            assert.strictEqual(argsDone.arguments, argDeltas);
+            console.log('✅ 21. Responses 流式工具调用（delta ↔ completed 参数一致）');
     passed++;
   }
 
