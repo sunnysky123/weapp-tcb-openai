@@ -220,15 +220,16 @@ async function promptModeCompletion(cloudbaseParams, openaiTools, requestedModel
 // ---------------------------------------------------------------- 流式 chat
 
 /**
- * 处理流式请求。直接向 res 写 OpenAI SSE 格式数据（含 data: [DONE]）。
+ * 处理流式请求。通过 sink 输出（Chat Completions chunk 或 Responses 事件）。
+ * sink 接口见 createChatSink / createResponsesSink。
  */
-async function chatCompletionStream(cloudbaseParams, openaiTools, requestedModel, res, signal) {
+async function chatCompletionStream(cloudbaseParams, openaiTools, requestedModel, sink, signal) {
   const hasTools = openaiTools && openaiTools.length > 0;
   const useNativeTools = hasTools && modeUsesNative();
 
   // prompt 模式：全量缓冲后解析合成 chunk（工具 JSON 块不能直接流给客户端）
   if (hasTools && !useNativeTools) {
-    return promptModeStream(cloudbaseParams, openaiTools, requestedModel, res);
+    return promptModeStream(cloudbaseParams, openaiTools, requestedModel, sink, signal);
   }
 
   const params = { ...cloudbaseParams };
@@ -240,17 +241,52 @@ async function chatCompletionStream(cloudbaseParams, openaiTools, requestedModel
 
   try {
     const streamRes = await getModel().streamText(params);
-    await pumpNativeStream(streamRes, requestedModel, res, hasTools);
+    await pumpNativeStream(streamRes, requestedModel, sink, hasTools);
   } catch (e) {
     // 只有还没向客户端写过任何字节（headers 未发出）时才能安全降级，
     // 否则 fallback 重跑整次请求会导致重复输出
-    if (useNativeTools && config.toolsMode === 'auto' && !res.headersSent) {
+    if (useNativeTools && config.toolsMode === 'auto' && !sink.res.headersSent) {
       nativeDisabledUntil = Date.now() + NATIVE_RETRY_DELAY_MS;
       log(`native tool path failed (${e.message}); falling back to prompt mode`);
-      return promptModeStream(cloudbaseParams, openaiTools, requestedModel, res);
+      return promptModeStream(cloudbaseParams, openaiTools, requestedModel, sink, signal);
     }
     throw toOpenAIError(e);
   }
+}
+
+// ---------------------------------------------------------------- 输出 sink
+
+// Chat Completions：data: {...} 帧 + 末尾 data: [DONE]
+function createChatSink(res, requestedModel) {
+  const meta = { id: genId('chatcmpl'), model: requestedModel };
+  return {
+    res,
+    begin() {
+      beginSse(res); // 首个 chunk 前才发响应头：上游早期报错仍能以正确状态码返回
+      sseWrite(res, buildChunk({ ...meta, delta: { role: 'assistant', content: '' } }));
+    },
+    content(text) {
+      if (text) sseWrite(res, buildChunk({ ...meta, delta: { content: text } }));
+    },
+    reasoning(text) {
+      if (text) sseWrite(res, buildChunk({ ...meta, delta: { reasoning_content: text } }));
+    },
+    toolCalls(list) {
+      if (Array.isArray(list) && list.length > 0) {
+        sseWrite(res, buildChunk({ ...meta, delta: { tool_calls: list } }));
+      }
+    },
+    streamError(e) {
+      sseWriteError(res, e);
+    },
+    end({ finishReason, usage } = {}) {
+      sseWrite(res, buildChunk({ ...meta, delta: {}, finishReason, usage }));
+      if (!res.writableEnded && !res.destroyed) {
+        res.write('data: [DONE]\n\n');
+        res.end();
+      }
+    },
+  };
 }
 
 // SSE 响应头必须等到确定开始流式输出时（拿到上游数据、写首个 chunk 前）再发：
@@ -282,12 +318,8 @@ function sseWriteError(res, e) {
   res.write(`data: ${JSON.stringify(payload)}\n\n`);
 }
 
-async function pumpNativeStream(streamRes, requestedModel, res, hasTools) {
-  const meta = { id: genId('chatcmpl'), model: requestedModel };
-
-  beginSse(res); // 首个 chunk 前才发响应头：上游早期报错仍能以正确状态码返回
-  // 首个 chunk：role
-  sseWrite(res, buildChunk({ ...meta, delta: { role: 'assistant', content: '' } }));
+async function pumpNativeStream(streamRes, requestedModel, sink, hasTools) {
+  sink.begin(); // 首个 chunk 前才发响应头：上游早期报错仍能以正确状态码返回
 
   let pending = ''; // 未下发的文本（含 DSML/fence 前缀观察窗口 / 缓冲区）
   let bufferedMode = false; // 检测到泄漏的工具调用标记后，转为全量缓冲
@@ -299,7 +331,7 @@ async function pumpNativeStream(streamRes, requestedModel, res, hasTools) {
   let streamError = null; // 流中途错误（收尾时以 error 帧告知，不混入正文）
 
   const emitContent = (t) => {
-    if (t) sseWrite(res, buildChunk({ ...meta, delta: { content: t } }));
+    if (t) sink.content(t);
   };
 
   // 内容增量路由：正常文本直接下发；疑似 DSML/JSON 工具块则扣留缓冲
@@ -379,12 +411,12 @@ async function pumpNativeStream(streamRes, requestedModel, res, hasTools) {
       const d = mapped.delta || {};
       if (Array.isArray(d.tool_calls) && d.tool_calls.length > 0) {
         sawToolCalls = true;
-        sseWrite(res, buildChunk({ ...meta, delta: { tool_calls: d.tool_calls } }));
+        sink.toolCalls(d.tool_calls);
       }
       if (mapped.finishReason) finishReason = mapped.finishReason;
       if (typeof d.content === 'string' && d.content) feedContent(d.content);
       if (typeof d.reasoning_content === 'string' && d.reasoning_content) {
-        sseWrite(res, buildChunk({ ...meta, delta: { reasoning_content: d.reasoning_content } }));
+        sink.reasoning(d.reasoning_content);
       }
     }
   } catch (e) {
@@ -411,22 +443,14 @@ async function pumpNativeStream(streamRes, requestedModel, res, hasTools) {
     const parsed = parseToolCallsFromText(fullText);
     if (parsed && parsed.toolCalls.length > 0) {
       for (const [i, tc] of parsed.toolCalls.entries()) {
-        sseWrite(
-          res,
-          buildChunk({
-            ...meta,
-            delta: {
-              tool_calls: [
-                {
-                  index: i,
-                  id: tc.id,
-                  type: 'function',
-                  function: { name: tc.function.name, arguments: tc.function.arguments },
-                },
-              ],
-            },
-          })
-        );
+        sink.toolCalls([
+          {
+            index: i,
+            id: tc.id,
+            type: 'function',
+            function: { name: tc.function.name, arguments: tc.function.arguments },
+          },
+        ]);
       }
       finalFinish = 'tool_calls';
       log('converted leaked tool-call markup from stream into structured tool_calls');
@@ -442,15 +466,9 @@ async function pumpNativeStream(streamRes, requestedModel, res, hasTools) {
   }
 
   // 流中途出错 → 独立 error 帧（客户端据此感知截断，而不是当成回答的一部分）
-  if (streamError) sseWriteError(res, streamError);
+  if (streamError) sink.streamError(streamError);
 
-  // 收尾 chunk：finish_reason + usage
-  const last = buildChunk({ ...meta, delta: {}, finishReason: finalFinish, usage });
-  sseWrite(res, last);
-  if (!res.writableEnded && !res.destroyed) {
-    res.write('data: [DONE]\n\n');
-    res.end();
-  }
+  sink.end({ finishReason: finalFinish, usage });
 }
 
 // dataStream 单个数据块 → OpenAI delta。兼容 OpenAI 形状与 AI SDK 形状
@@ -479,49 +497,29 @@ function mapStreamChunk(data) {
   return null;
 }
 
-// 降级流式：非流式请求 + 手动合成 chunk
-async function promptModeStream(cloudbaseParams, openaiTools, requestedModel, res) {
-  const meta = { id: genId('chatcmpl'), model: requestedModel };
-
-  const raw = await promptModeCompletion(cloudbaseParams, openaiTools, requestedModel);
+// 降级流式：非流式请求 + 手动合成事件
+async function promptModeStream(cloudbaseParams, openaiTools, requestedModel, sink, signal) {
+  const raw = await promptModeCompletion(cloudbaseParams, openaiTools, requestedModel, signal);
   const message = raw.message;
 
-  beginSse(res); // 上游完成后再发响应头：降级请求失败也能以正确状态码返回
+  sink.begin(); // 上游完成后再发响应头：降级请求失败也能以正确状态码返回
 
-  sseWrite(res, buildChunk({ ...meta, delta: { role: 'assistant', content: '' } }));
-
-  if (message.content) {
-    sseWrite(res, buildChunk({ ...meta, delta: { content: message.content } }));
-  }
+  if (message.reasoning_content) sink.reasoning(message.reasoning_content);
+  if (message.content) sink.content(message.content);
   if (Array.isArray(message.tool_calls)) {
     for (const [i, tc] of message.tool_calls.entries()) {
-      sseWrite(
-        res,
-        buildChunk({
-          ...meta,
-          delta: {
-            tool_calls: [
-              {
-                index: i,
-                id: tc.id,
-                type: 'function',
-                function: { name: tc.function.name, arguments: tc.function.arguments },
-              },
-            ],
-          },
-        })
-      );
+      sink.toolCalls([
+        {
+          index: i,
+          id: tc.id,
+          type: 'function',
+          function: { name: tc.function.name, arguments: tc.function.arguments },
+        },
+      ]);
     }
   }
 
-  sseWrite(
-    res,
-    buildChunk({ ...meta, delta: {}, finishReason: raw.finishReason, usage: raw.usage })
-  );
-  if (!res.writableEnded && !res.destroyed) {
-    res.write('data: [DONE]\n\n');
-    res.end();
-  }
+  sink.end({ finishReason: raw.finishReason, usage: raw.usage });
 }
 
 // ---------------------------------------------------------------- 工具函数
@@ -542,5 +540,6 @@ module.exports = {
   getModel,
   chatCompletion,
   chatCompletionStream,
+  createChatSink,
   toOpenAIError,
 };

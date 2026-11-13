@@ -10,6 +10,18 @@ const {
   openaiError,
   nowSec,
 } = require('./convert');
+const {
+  fromResponsesTools,
+  toCloudbaseParamsFromResponses,
+  buildResponseObject,
+  createResponsesSink,
+  loadPrevious,
+  savePrevious,
+  getStoredResponse,
+  deleteStoredResponse,
+  paramsWithAssistant,
+  assistantMessageFromRaw,
+} = require('./responses');
 const cb = require('./cloudbase');
 
 // ---------------------------------------------------------------- 请求体解析
@@ -78,9 +90,21 @@ function sendError(res, e) {
   if (res.headersSent) {
     // 响应头已发出（SSE 已开始）：状态码改不了，以 error 帧收尾，避免裸 JSON 混进事件流
     if (res._sse) {
-      res.write(`data: ${JSON.stringify(payload)}\n\n`);
-      res.write('data: [DONE]\n\n');
-      res.end();
+      if (res._responsesSse) {
+        // Responses 流：error 事件 + response.failed，不使用 [DONE] 哨兵
+        const message = payload.error.message;
+        res.write(
+          `event: error\ndata: ${JSON.stringify({ type: 'error', code: payload.error.code || 'server_error', message, param: null })}\n\n`
+        );
+        res.write(
+          `event: response.failed\ndata: ${JSON.stringify({ type: 'response.failed', response: { id: null, object: 'response', status: 'failed', error: payload.error } })}\n\n`
+        );
+        res.end();
+      } else {
+        res.write(`data: ${JSON.stringify(payload)}\n\n`);
+        res.write('data: [DONE]\n\n');
+        res.end();
+      }
     } else {
       res.end(JSON.stringify(payload));
     }
@@ -155,10 +179,11 @@ const routes = {
     const wantsStream = body.stream === true;
 
     if (wantsStream) {
-      // SSE 响应头由 cb.chatCompletionStream 在拿到上游数据、写首个 chunk 前才发，
+      // SSE 响应头由 sink 在拿到上游数据、写首个 chunk 前才发，
       // 上游早期报错（如 429）才能以正确状态码返回而不是 200 + SSE 里的裸 JSON
       const signal = abortOnClientClose(res);
-      await cb.chatCompletionStream(cloudbaseParams, openaiTools, requestedModel, res, signal);
+      const sink = cb.createChatSink(res, requestedModel);
+      await cb.chatCompletionStream(cloudbaseParams, openaiTools, requestedModel, sink, signal);
       return;
     }
 
@@ -168,7 +193,125 @@ const routes = {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(completion));
   },
+
+  // ------------------------------------------------------------ Responses API
+
+  'POST /v1/responses': async (req, res) => {
+    const body = await readJsonBody(req);
+
+    const responseMeta = {
+      model: mapModel(body.model, config),
+      instructions: typeof body.instructions === 'string' ? body.instructions : null,
+      max_output_tokens: body.max_output_tokens ?? null,
+      parallel_tool_calls: body.parallel_tool_calls,
+      reasoning: body.reasoning || null,
+      temperature: body.temperature ?? null,
+      top_p: body.top_p ?? null,
+      tool_choice: body.tool_choice ?? 'auto',
+      tools: Array.isArray(body.tools) ? body.tools : [],
+      text: body.text || { format: { type: 'text' } },
+      user: body.user ?? null,
+      metadata: body.metadata || {},
+      previous_response_id: body.previous_response_id ?? null,
+    };
+
+    if (config.debug) {
+      const inputItems = Array.isArray(body.input) ? body.input.length : 0;
+      console.log(
+        `[server] responses model=${body.model} stream=${!!body.stream} ` +
+          `tools=${Array.isArray(body.tools) ? body.tools.length : 0} ` +
+          `inputItems=${inputItems}`
+      );
+    }
+
+    // previous_response_id：客户端只发增量时，从进程内历史补全上下文
+    const priorMessages = body.previous_response_id
+      ? loadPrevious(body.previous_response_id)
+      : [];
+    const cloudbaseParams = toCloudbaseParamsFromResponses(body, config, priorMessages);
+    const openaiTools = fromResponsesTools(body.tools);
+    const shouldStore = body.store !== false;
+    const signal = abortOnClientClose(res);
+
+    if (body.stream === true) {
+      const sink = createResponsesSink(res, responseMeta);
+      const responseId = sink.responseId;
+      await cb.chatCompletionStream(
+        cloudbaseParams,
+        openaiTools,
+        responseMeta.model,
+        sink,
+        signal
+      );
+      if (shouldStore) {
+        const message = sink.finalMessage();
+        savePrevious(
+          responseId,
+          message ? paramsWithAssistant(cloudbaseParams, message) : cloudbaseParams.messages,
+          sink.finalResponse()
+        );
+      }
+      return;
+    }
+
+    const raw = await cb.chatCompletion(cloudbaseParams, openaiTools, responseMeta.model, signal);
+    const response = buildResponseObject(raw, responseMeta);
+    if (shouldStore) {
+      savePrevious(response.id, paramsWithAssistant(cloudbaseParams, assistantMessageFromRaw(raw)), response);
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(response));
+  },
+
+  // GET /v1/responses/{id}：取回已生成响应
+  'GET /v1/responses/:id': async (req, res) => {
+    const id = req.params.id;
+    if (!id) {
+      throw openaiError('response id is required', 'invalid_request_error', 'missing_id', 400);
+    }
+    const response = getStoredResponse(id);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(response));
+  },
+
+  // DELETE /v1/responses/{id}：删除已存响应（不做真实存储，仅移除进程内副本）
+  'DELETE /v1/responses/:id': async (req, res) => {
+    const id = req.params.id;
+    if (!id) {
+      throw openaiError('response id is required', 'invalid_request_error', 'missing_id', 400);
+    }
+    deleteStoredResponse(id);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ id, object: 'response.deleted', deleted: true }));
+  },
 };
+
+// 解析路由：先精确匹配，再按 "METHOD /a/:param" 模式匹配
+function resolveRoute(method, pathname) {
+  const exact = routes[`${method} ${pathname}`];
+  if (exact) return { handler: exact, params: {} };
+
+  const segments = pathname.split('/').filter(Boolean);
+  for (const [pattern, handler] of Object.entries(routes)) {
+    const [patternMethod, patternPath] = pattern.split(' ');
+    if (patternMethod !== method || !patternPath.includes(':')) continue;
+    const patternSegments = patternPath.split('/').filter(Boolean);
+    if (patternSegments.length !== segments.length) continue;
+    const params = {};
+    let ok = true;
+    for (let i = 0; i < patternSegments.length; i++) {
+      const seg = patternSegments[i];
+      if (seg.startsWith(':')) {
+        params[seg.slice(1)] = decodeURIComponent(segments[i]);
+      } else if (seg !== segments[i]) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) return { handler, params };
+  }
+  return null;
+}
 
 // ---------------------------------------------------------------- 服务器
 
@@ -177,14 +320,15 @@ function isLoopback(host) {
 }
 
 const server = http.createServer(async (req, res) => {
-  const key = `${req.method} ${req.url.split('?')[0]}`;
+  const pathname = req.url.split('?')[0];
+  const key = `${req.method} ${pathname}`;
   // CORS：让浏览器端 / webview 客户端也能直连（错误路径同样生效，writeHead 会合并这里的字段）
   res.setHeader('Access-Control-Allow-Origin', '*');
   try {
     // 预检请求不鉴权，直接放行
     if (req.method === 'OPTIONS') {
       res.writeHead(204, {
-        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+        'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
         'Access-Control-Allow-Headers': 'Authorization, Content-Type',
         'Access-Control-Max-Age': '86400',
       });
@@ -193,16 +337,17 @@ const server = http.createServer(async (req, res) => {
     }
     // /health 豁免鉴权：探活 / 负载均衡不应拿到 401
     if (key !== 'GET /health') checkAuth(req);
-    const handler = routes[key];
-    if (!handler) {
+    const matched = resolveRoute(req.method, pathname);
+    if (!matched) {
       throw openaiError(
-        `unknown route: ${key}. Available: GET /health, GET /v1/models, POST /v1/chat/completions`,
+        `unknown route: ${key}. Available: GET /health, GET /v1/models, POST /v1/chat/completions, POST /v1/responses, GET /v1/responses/:id, DELETE /v1/responses/:id`,
         'invalid_request_error',
         'not_found',
         404
       );
     }
-    await handler(req, res);
+    req.params = matched.params;
+    await matched.handler(req, res);
   } catch (e) {
     sendError(res, e);
   }
@@ -223,9 +368,12 @@ server.listen(config.port, config.host, () => {
     }
   }
   console.log('[server] OpenAI-compatible endpoints:');
-  console.log('[server]   POST /v1/chat/completions');
-  console.log('[server]   GET  /v1/models');
-  console.log('[server]   GET  /health');
+  console.log('[server]   POST   /v1/chat/completions');
+  console.log('[server]   POST   /v1/responses');
+  console.log('[server]   GET    /v1/responses/:id');
+  console.log('[server]   DELETE /v1/responses/:id');
+  console.log('[server]   GET    /v1/models');
+  console.log('[server]   GET    /health');
 });
 
 server.on('error', (e) => {

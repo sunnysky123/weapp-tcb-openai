@@ -1,6 +1,6 @@
 # cloudbase-openai-adapter
 
-把腾讯云 [CloudBase Node SDK](https://docs.cloudbase.net/ai/model/nodejs-access) 的大模型调用封装成 **OpenAI Chat Completions 兼容接口**，供本地 agent（ZCode / Cline / LangChain / OpenAI SDK 等）以 OpenAI 兼容模式直连使用。
+把腾讯云 [CloudBase Node SDK](https://docs.cloudbase.net/ai/model/nodejs-access) 的大模型调用封装成 **OpenAI 兼容接口**（Chat Completions + Responses），供本地 agent（ZCode / Cline / Codex / LangChain / OpenAI SDK 等）以 OpenAI 兼容模式直连使用。
 
 ```
 本地 agent ──OpenAI 格式──▶ 本适配器(127.0.0.1:8090) ──@cloudbase/node-sdk──▶ CloudBase AI 大模型
@@ -10,11 +10,12 @@
 
 | 能力 | 说明 |
 | --- | --- |
-| 非流式对话 | `POST /v1/chat/completions`（`stream: false`） |
-| 流式对话 | SSE，逐 token 输出，末尾 `data: [DONE]` |
-| 深度思考 | `reasoning_effort` 透传，`reasoning_content` 随 delta 返回 |
-| 多模态 | `image_url` 类型的 content parts 直接透传 |
-| 工具调用 | OpenAI `tools` / `tool_calls` / `role:"tool"` 完整往返 |
+| 非流式对话 | `POST /v1/chat/completions`、`POST /v1/responses`（`stream: false`） |
+| 流式对话 | SSE，逐 token 输出；Chat 以 `data: [DONE]` 收尾，Responses 以 `response.completed` 事件收尾 |
+| Responses API | `input` / `instructions` / `function_call` / `previous_response_id` / 检索与删除 |
+| 深度思考 | `reasoning_effort`（Chat）/ `reasoning.effort`（Responses）透传，思维链随流式事件返回 |
+| 多模态 | `image_url`（Chat）/ `input_image`（Responses）类型的 content parts 直接透传 |
+| 工具调用 | 两套协议的 `tools` / `tool_calls` 完整往返 |
 | 模型列表 | `GET /v1/models`（默认模型 + MODEL_MAP 别名） |
 
 ## 快速开始
@@ -42,6 +43,7 @@ npm run test:mock       # 离线端到端测试（mock SDK，无需凭证，跑�
 npm run test:nonstream  # 非流式（需真实凭证）
 npm run test:stream     # 流式（需真实凭证）
 npm run test:tools      # 工具调用两轮对话（需真实凭证）
+npm run test:responses  # Responses API（非流式/流式/工具/previous_response_id）
 ```
 
 ## 接入本地 agent
@@ -65,6 +67,46 @@ const res = await client.chat.completions.create({
   messages: [{ role: 'user', content: '介绍一下李白' }],
 });
 console.log(res.choices[0].message.content);
+```
+
+### Responses API
+
+`baseURL` 同上。支持 `input`、`instructions`、`tools`（扁平 function 定义）、
+`previous_response_id`、`store`、`stream`：
+
+```js
+const client = new OpenAI({ apiKey: '你的API_KEY', baseURL: 'http://127.0.0.1:8090/v1' });
+
+const first = await client.responses.create({
+  model: 'hy3',
+  instructions: '你是简洁的中文助手。',
+  input: '北京今天天气怎么样？',
+  tools: [
+    {
+      type: 'function',
+      name: 'get_weather',
+      description: '查询城市天气',
+      parameters: { type: 'object', properties: { city: { type: 'string' } }, required: ['city'] },
+    },
+  ],
+});
+const call = first.output.find((o) => o.type === 'function_call');
+
+const second = await client.responses.create({
+  model: 'hy3',
+  previous_response_id: first.id, // 自动串接历史
+  input: [{ type: 'function_call_output', call_id: call.call_id, output: '北京：26°C，晴' }],
+});
+console.log(second.output_text);
+```
+
+curl 也可直接流式调用：
+
+```bash
+curl -N http://127.0.0.1:8090/v1/responses \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $API_KEY" \
+  -d '{"model":"hy3","stream":true,"input":"写一首春天的五言绝句"}'
 ```
 
 ## 配置（环境变量 / .env）
@@ -97,10 +139,37 @@ console.log(res.choices[0].message.content);
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | POST | `/v1/chat/completions` | OpenAI Chat Completions 兼容（支持 `stream`、`tools`、`reasoning_effort`） |
+| POST | `/v1/responses` | OpenAI Responses API 兼容（支持 `input`、`instructions`、`tools`、`previous_response_id`、`store`、`stream`） |
+| GET | `/v1/responses/{id}` | 取回本进程内已生成的响应（`store: false` 时不保存） |
+| DELETE | `/v1/responses/{id}` | 删除本进程内的响应副本 |
 | GET | `/v1/models` | 模型列表 |
 | GET | `/health` | 健康检查 |
 
 错误统一为 OpenAI 风格：`{"error": {"message", "type", "code"}}`。
+
+## Responses API 说明
+
+请求/响应字段映射：
+
+| Responses API | 本适配器处理 |
+| --- | --- |
+| `input`（string 或 item 数组） | `message` / `function_call` / `function_call_output` 转为 Chat `messages`；相邻 `function_call` 合并为同一条 `assistant.tool_calls`；`developer` 角色映射为 `system` |
+| `instructions` | 作为最前面的 system 消息注入（与历史里已有内容相同时不重复注入） |
+| `input_text` / `input_image` | 转为 `text` / `image_url` parts |
+| `tools`（扁平 `{type:'function', name, ...}`） | 转为 Chat `tools`；`web_search` 等内置工具被忽略 |
+| `tool_choice` | `auto`/`none`/`required` 直通，`{type:'function', name}` 转为 Chat 形状 |
+| `max_output_tokens` | → `max_tokens` |
+| `reasoning.effort` | → `reasoning_effort` |
+| `text.format` | `json_object` / `json_schema` → `response_format` |
+| `previous_response_id` | 从进程内历史（TTL 30 分钟、上限 100 条）补全上下文 |
+| `store` | `false` 时不写入进程内存储（也不可检索/续接） |
+
+输出侧：
+
+- 非流式返回标准 `object: "response"` 对象，`output` 含 `reasoning`（若有思维链）、`message`（`output_text`）与 `function_call` 条目。
+- 流式按规范顺序发送事件：`response.created` → `response.in_progress` → `response.output_item.added` / `content_part.added` → `response.output_text.delta`（或 `response.function_call_arguments.delta`）→ `*.done` → `response.completed`。没有 `data: [DONE]` 哨兵。
+- 截断（上游 `finish_reason: length`）映射为 `status: "incomplete"` + `incomplete_details.reason: "max_output_tokens"`；流中途出错则以 `error` 事件 + `response.failed` 收尾。
+- `previous_response_id` 的历史保存在**进程内存**中，重启即失效；多实例部署时请让同一会话命中同一实例。
 
 ## 部署到云函数（可选）
 
@@ -110,4 +179,6 @@ console.log(res.choices[0].message.content);
 
 - 仅支持 `n=1`（单路输出）
 - 降级模式的流式输出为「先缓冲再合成」，工具场景下无逐字流式效果
+- Responses 的 `previous_response_id` / 响应检索走进程内存，不做持久化
+- Responses 内置工具（`web_search`、`file_search`、`code_interpreter`、`mcp` 等）未实现，会被忽略
 - 图片生成（`generateImage`）未封装，需要时可按 CloudBase 文档扩展 `/v1/images/generations`

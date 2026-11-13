@@ -308,6 +308,15 @@ async function post(body, headers = {}) {
   return res;
 }
 
+async function postResponses(body, headers = {}) {
+  const res = await fetch(`${BASE}/v1/responses`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${TEST_API_KEY}`, ...headers },
+    body: JSON.stringify(body),
+  });
+  return res;
+}
+
 async function readSSE(res) {
   const text = await res.text();
   const frames = text
@@ -318,6 +327,20 @@ async function readSSE(res) {
   const chunks = frames.filter((o) => o.choices);
   const errorFrame = frames.find((o) => o.error) || null;
   return { chunks, gotDone: text.includes('data: [DONE]'), errorFrame, raw: text };
+}
+
+// Responses API 的 SSE：每帧形如 "event: <type>\ndata: <json>\n\n"
+async function readResponsesSSE(res) {
+  const text = await res.text();
+  const events = text
+    .split('\n\n')
+    .filter((f) => f.trim())
+    .map((f) => {
+      const line = f.split('\n').find((l) => l.startsWith('data: '));
+      return line ? JSON.parse(line.slice(6)) : null;
+    })
+    .filter(Boolean);
+  return { events, raw: text };
 }
 
 async function main() {
@@ -690,6 +713,356 @@ async function main() {
       assert.strictEqual(systems[0].content, '你是测试助手', '原生模式不应注入协议提示词');
     }
     console.log(`✅ 17. system 消息合并（${promptMode ? '协议 + 客户端内容合一' : '原生模式透传'}）`);
+    passed++;
+  }
+
+  // 18. Responses API：非流式普通对话
+  {
+    const res = await postResponses({
+      model: 'default',
+      instructions: '你是测试助手',
+      input: '你好',
+    });
+    const data = await res.json();
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual(data.object, 'response');
+    assert.strictEqual(data.status, 'completed');
+    assert.strictEqual(data.instructions, '你是测试助手');
+    const msgItem = data.output.find((o) => o.type === 'message');
+    assert.ok(msgItem, '应有 message 输出项');
+    assert.strictEqual(msgItem.role, 'assistant');
+    assert.strictEqual(msgItem.content[0].type, 'output_text');
+    assert.strictEqual(msgItem.content[0].text, 'mock 回复: 你好');
+    assert.strictEqual(data.usage.input_tokens, 3);
+    assert.strictEqual(data.usage.output_tokens, 4);
+    assert.strictEqual(data.usage.total_tokens, 7);
+    console.log('✅ 18. Responses 非流式对话（instructions → system，output_text）');
+    passed++;
+  }
+
+  // 19. Responses API：流式普通对话（事件顺序 + delta 累积）
+  {
+    const res = await postResponses({ model: 'default', stream: true, input: '你好' });
+    assert.strictEqual(res.status, 200);
+    assert.ok(res.headers.get('content-type').includes('text/event-stream'));
+    const { events } = await readResponsesSSE(res);
+    const types = events.map((e) => e.type);
+    assert.strictEqual(types[0], 'response.created');
+    assert.ok(types.includes('response.in_progress'));
+    assert.ok(types.includes('response.output_item.added'));
+    assert.ok(types.includes('response.content_part.added'));
+    assert.ok(types.includes('response.output_text.delta'));
+    assert.ok(types.includes('response.output_text.done'));
+    assert.ok(types.includes('response.content_part.done'));
+    assert.ok(types.includes('response.output_item.done'));
+    assert.strictEqual(types[types.length - 1], 'response.completed', '最后应是 completed');
+    const text = events
+      .filter((e) => e.type === 'response.output_text.delta')
+      .map((e) => e.delta)
+      .join('');
+    assert.strictEqual(text, '你好');
+    // reasoning 也应以 reasoning_summary 事件暴露
+    const reasoning = events
+      .filter((e) => e.type === 'response.reasoning_summary_text.delta')
+      .map((e) => e.delta)
+      .join('');
+    assert.strictEqual(reasoning, '思考中…');
+    // sequence_number 单调递增
+    const seqs = events.map((e) => e.sequence_number);
+    assert.deepStrictEqual(seqs, seqs.map((_, i) => i), 'sequence_number 应从 0 递增');
+    const done = events[events.length - 1];
+    assert.strictEqual(done.response.usage.input_tokens, 6);
+    assert.strictEqual(done.response.usage.output_tokens, 2);
+    assert.strictEqual(done.response.usage.total_tokens, 8);
+    const doneMsg = done.response.output.find((o) => o.type === 'message');
+    assert.strictEqual(doneMsg.content[0].text, '你好');
+    assert.ok(!res.headers.get('content-type').includes('json'));
+    console.log('✅ 19. Responses 流式对话（事件序列/sequence_number/usage/无 DONE 哨兵）');
+    passed++;
+  }
+
+  // 20. Responses API：工具调用非流式（function_call 输出项）→ 第二轮回传 function_call_output
+  {
+    const tools = [
+      {
+        type: 'function',
+        name: 'get_weather',
+        description: '查天气',
+        parameters: { type: 'object', properties: { city: { type: 'string' } }, required: ['city'] },
+      },
+    ];
+    const res = await postResponses({
+      model: 'default',
+      input: '北京天气？',
+      tools,
+    });
+    const data = await res.json();
+    assert.strictEqual(res.status, 200);
+    const call = data.output.find((o) => o.type === 'function_call');
+    assert.ok(call, '应有 function_call 输出项');
+    assert.strictEqual(call.name, 'get_weather');
+    assert.strictEqual(call.status, 'completed');
+    assert.deepStrictEqual(JSON.parse(call.arguments), { city: '北京' });
+    assert.ok(call.call_id, '应有 call_id 供回传');
+
+    // 第二轮：Responses 原生形状回传工具结果
+    const res2 = await postResponses({
+      model: 'default',
+      tools,
+      input: [
+        { type: 'message', role: 'user', content: [{ type: 'input_text', text: '北京天气？' }] },
+        { type: 'function_call', call_id: call.call_id, name: call.name, arguments: call.arguments },
+        { type: 'function_call_output', call_id: call.call_id, output: '北京：26°C，晴' },
+      ],
+    });
+    const data2 = await res2.json();
+    assert.strictEqual(res2.status, 200);
+    const msgItem = data2.output.find((o) => o.type === 'message');
+    assert.ok(msgItem.content[0].text.includes('26°C'), '第二轮应给出最终回答');
+    console.log('✅ 20. Responses 工具调用两轮（function_call ↔ function_call_output）');
+    passed++;
+  }
+
+  // 21. Responses API：流式工具调用（function_call_arguments delta + response.completed）
+  {
+    const tools = [
+      {
+        type: 'function',
+        name: 'get_weather',
+        description: '查天气',
+        parameters: { type: 'object', properties: { city: { type: 'string' } } },
+      },
+    ];
+    const res = await postResponses({
+      model: 'default',
+      stream: true,
+      input: '北京天气？',
+      tools,
+    });
+    const { events } = await readResponsesSSE(res);
+    const types = events.map((e) => e.type);
+    assert.ok(types.includes('response.function_call_arguments.delta'), '应有参数增量事件');
+    assert.ok(types.includes('response.function_call_arguments.done'));
+    const argDeltas = events
+      .filter((e) => e.type === 'response.function_call_arguments.delta')
+      .map((e) => e.delta)
+      .join('');
+    assert.deepStrictEqual(JSON.parse(argDeltas), { city: '北京' });
+    assert.strictEqual(types[types.length - 1], 'response.completed');
+    const call = events[events.length - 1].response.output.find((o) => o.type === 'function_call');
+    assert.ok(call, 'completed 响应里应含 function_call');
+    assert.strictEqual(call.name, 'get_weather');
+    assert.strictEqual(call.status, 'completed');
+    console.log('✅ 21. Responses 流式工具调用（arguments delta → function_call 条目）');
+    passed++;
+  }
+
+  // 22. Responses API：请求体错误与内容转换
+  {
+    const { inputToMessages, withInstructions, fromResponsesTools } = require('../src/responses.js');
+    const msgs = inputToMessages({
+      input: [
+        { role: 'developer', content: 'dev' },
+        { role: 'user', content: [{ type: 'input_text', text: '看图' }, { type: 'input_image', image_url: 'data:image/png;base64,AAA' }] },
+        { type: 'function_call', call_id: 'call_1', name: 'f', arguments: '{"a":1}' },
+        { type: 'function_call', call_id: 'call_2', name: 'g', arguments: { b: 2 } },
+        { type: 'function_call_output', call_id: 'call_1', output: { ok: true } },
+        { type: 'function_call_output', call_id: 'call_2', output: [{ type: 'output_text', text: 'done' }] },
+      ],
+    });
+    assert.strictEqual(msgs[0].role, 'system', 'developer 应映射为 system');
+    assert.ok(Array.isArray(msgs[1].content), '多模态内容应保留 parts');
+    assert.strictEqual(msgs[1].content[1].type, 'image_url');
+    // 相邻 function_call 合并进同一条 assistant
+    assert.strictEqual(msgs[2].role, 'assistant');
+    assert.strictEqual(msgs[2].tool_calls.length, 2);
+    assert.strictEqual(msgs[2].tool_calls[1].function.arguments, '{"b":2}');
+    assert.strictEqual(msgs[3].role, 'tool');
+    assert.strictEqual(msgs[3].content, '{"ok":true}');
+    assert.strictEqual(msgs[4].content, 'done');
+
+    // instructions 作为最前面的 system
+    const withSys = withInstructions(msgs, 'sys');
+    assert.strictEqual(withSys.length, msgs.length + 1);
+    assert.strictEqual(withSys[0].role, 'system');
+    assert.strictEqual(withSys[0].content, 'sys');
+
+    // 内置工具（web_search）应被丢弃，只保留扁平 function 工具
+    assert.strictEqual(fromResponsesTools([{ type: 'web_search' }, { type: 'function', name: 'f', parameters: {} }]).length, 1);
+
+    const bad = await postResponses({ model: 'default' });
+    assert.strictEqual(bad.status, 400);
+    assert.strictEqual((await bad.json()).error.code, 'missing_input');
+    console.log('✅ 22. Responses 请求转换（developer→system / 多模态 / call 合并 / 缺省 400）');
+    passed++;
+  }
+
+  // 23. Responses API：previous_response_id 多轮上下文
+  {
+    const r1 = await postResponses({ model: 'default', input: '第一问' });
+    const d1 = await r1.json();
+    assert.ok(d1.id, '第一轮应有 response id');
+
+    const r2 = await postResponses({
+      model: 'default',
+      input: '第二问',
+      previous_response_id: d1.id,
+    });
+    const d2 = await r2.json();
+    assert.strictEqual(r2.status, 200);
+    assert.strictEqual(d2.previous_response_id, d1.id);
+    // 上游应收到合并后的历史：用户第一问 + assistant 第一答 + 用户第二问
+    const msgs = lastGenerateParams.messages;
+    assert.strictEqual(msgs.length, 3, `历史应合并为 3 条，实际 ${msgs.length}`);
+    assert.strictEqual(msgs[0].content, '第一问');
+    assert.strictEqual(msgs[1].role, 'assistant');
+    assert.strictEqual(msgs[1].content, 'mock 回复: 第一问');
+    assert.strictEqual(msgs[2].content, '第二问');
+
+    // 未知 id → 404
+    const bad = await postResponses({ model: 'default', input: 'x', previous_response_id: 'resp_nope' });
+    assert.strictEqual(bad.status, 404);
+    assert.strictEqual((await bad.json()).error.code, 'previous_response_not_found');
+    console.log('✅ 23. previous_response_id 多轮上下文（历史合并 / 未知 id 404）');
+    passed++;
+  }
+
+  // 24. Responses API：流式 + 工具调用后 previous_response_id 也带上 tool_calls 历史
+  {
+    const tools = [
+      { type: 'function', name: 'get_weather', description: '查天气', parameters: { type: 'object', properties: { city: { type: 'string' } } } },
+    ];
+    const r1 = await postResponses({ model: 'default', stream: true, input: '北京天气？', tools });
+    const { events } = await readResponsesSSE(r1);
+    const completed = events[events.length - 1].response;
+    const call = completed.output.find((o) => o.type === 'function_call');
+    assert.ok(call);
+
+    await postResponses({
+      model: 'default',
+      input: [
+        { type: 'function_call_output', call_id: call.call_id, output: '北京：26°C，晴' },
+      ],
+      previous_response_id: completed.id,
+      tools,
+    });
+    const msgs = lastGenerateParams.messages;
+    const assistantMsg = msgs.find((m) => m.role === 'assistant');
+    assert.ok(assistantMsg, '历史里应有 assistant 消息');
+    assert.strictEqual(assistantMsg.tool_calls[0].id, call.call_id, 'tool_calls 应保留 call_id');
+    assert.strictEqual(msgs[msgs.length - 1].role, 'tool');
+    console.log('✅ 24. 流式工具轮 + previous_response_id（assistant tool_calls 历史保留）');
+    passed++;
+  }
+
+  // 25. Responses API：上游早期报错 → JSON 502（而非 200 + SSE）
+  {
+    const res = await postResponses({
+      model: 'default',
+      stream: true,
+      input: '上游错误',
+    });
+    assert.strictEqual(res.status, 502);
+    assert.ok((res.headers.get('content-type') || '').includes('application/json'));
+    assert.strictEqual((await res.json()).error.code, 'upstream_error');
+    console.log('✅ 25. Responses 流式早期报错返回 502 JSON');
+    passed++;
+  }
+
+  // 26. Responses API：流中途出错 → error 事件 + response.failed 收尾
+  {
+    const res = await postResponses({
+      model: 'default',
+      stream: true,
+      input: '中途错误',
+    });
+    assert.strictEqual(res.status, 200);
+    const { events } = await readResponsesSSE(res);
+    const types = events.map((e) => e.type);
+    assert.ok(types.includes('error'), '应有 error 事件');
+    assert.strictEqual(types[types.length - 1], 'response.failed', '最后应是 failed');
+    const failed = events[events.length - 1].response;
+    assert.strictEqual(failed.status, 'failed');
+    assert.ok(failed.error && failed.error.message, 'failed 响应应带 error');
+    const text = events
+      .filter((e) => e.type === 'response.output_text.delta')
+      .map((e) => e.delta)
+      .join('');
+    assert.strictEqual(text, '答案', '错误信息不得混进正文');
+    console.log('✅ 26. Responses 流中途错误 → error 事件 + response.failed');
+    passed++;
+  }
+
+  // 27. finish_reason=length → response.incomplete + max_output_tokens
+  {
+    const { buildResponseObject } = require('../src/responses.js');
+    const obj = buildResponseObject(
+      { model: 'm', message: { role: 'assistant', content: '半句' }, finishReason: 'length' },
+      { model: 'm' }
+    );
+    assert.strictEqual(obj.status, 'incomplete');
+    assert.deepStrictEqual(obj.incomplete_details, { reason: 'max_output_tokens' });
+    console.log('✅ 27. 截断响应映射为 response.incomplete');
+    passed++;
+  }
+
+  // 28. Responses API：GET / DELETE /v1/responses/{id}
+  {
+    const r1 = await postResponses({ model: 'default', input: '可检索的一轮' });
+    const d1 = await r1.json();
+
+    const got = await fetch(`${BASE}/v1/responses/${d1.id}`, {
+      headers: { Authorization: `Bearer ${TEST_API_KEY}` },
+    });
+    assert.strictEqual(got.status, 200);
+    const stored = await got.json();
+    assert.strictEqual(stored.id, d1.id);
+    assert.strictEqual(stored.object, 'response');
+    assert.strictEqual(stored.output[0].content[0].text, 'mock 回复: 可检索的一轮');
+
+    const del = await fetch(`${BASE}/v1/responses/${d1.id}`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${TEST_API_KEY}` },
+    });
+    assert.strictEqual(del.status, 200);
+    assert.deepStrictEqual(await del.json(), {
+      id: d1.id,
+      object: 'response.deleted',
+      deleted: true,
+    });
+
+    const gone = await fetch(`${BASE}/v1/responses/${d1.id}`, {
+      headers: { Authorization: `Bearer ${TEST_API_KEY}` },
+    });
+    assert.strictEqual(gone.status, 404);
+    assert.strictEqual((await gone.json()).error.code, 'response_not_found');
+    console.log('✅ 28. GET/DELETE /v1/responses/:id（检索 / 删除 / 404）');
+    passed++;
+  }
+
+  // 29. store:false 不写入检索存储
+  {
+    const r1 = await postResponses({ model: 'default', input: '不存', store: false });
+    const d1 = await r1.json();
+    const got = await fetch(`${BASE}/v1/responses/${d1.id}`, {
+      headers: { Authorization: `Bearer ${TEST_API_KEY}` },
+    });
+    assert.strictEqual(got.status, 404);
+    console.log('✅ 29. store:false 不进入进程内存储');
+    passed++;
+  }
+
+  // 30. Responses 流中途出现未捕获异常 → error 事件收尾（不写 Chat 风格 [DONE]）
+  {
+    const hit = await fetch(`${BASE}/v1/responses`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${TEST_API_KEY}` },
+      body: JSON.stringify({ model: 'default', stream: true, input: '中途错误' }),
+    });
+    const raw = await hit.text();
+    assert.ok(!raw.includes('[DONE]'), 'Responses 流不应出现 [DONE] 哨兵');
+    assert.ok(raw.includes('event: error') || raw.includes('response.failed'));
+    console.log('✅ 30. Responses 流错误收尾（无 [DONE]，走 error/response.failed）');
     passed++;
   }
 
